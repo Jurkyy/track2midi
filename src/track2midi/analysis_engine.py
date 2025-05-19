@@ -148,34 +148,78 @@ def extract_features_for_onset(
     end_sample = min(len(audio_data), onset_sample + window_samples // 2)
     window = audio_data[start_sample:end_sample]
     
+    # Add a check for empty or very short window to prevent errors
+    if len(window) < 4: # Minimum length for FFT and meaningful features (e.g. a few samples for rfft)
+        logger.warning(f"Onset at {onset_time:.3f}s has a very short window (len: {len(window)}). Returning zero features.")
+        return {
+            "spectral_centroid": 0.0,
+            "spectral_bandwidth": 0.0,
+            "spectral_rolloff": 0.0,
+            "zero_crossing_rate": 0.0,
+            "spectral_flatness": 0.0,
+            "spectral_spread": 0.0,
+            "rms": 0.0,
+        }
+
     # Calculate FFT
     fft = np.abs(np.fft.rfft(window))
     freqs = np.fft.rfftfreq(len(window), 1/sr)
     
     # Calculate features
-    # Spectral centroid
-    centroid = np.sum(freqs * fft) / np.sum(fft)
-    
-    # Spectral bandwidth
-    bandwidth = np.sqrt(np.sum((freqs - centroid)**2 * fft) / np.sum(fft))
-    
-    # Spectral rolloff (95th percentile)
-    rolloff = freqs[np.where(np.cumsum(fft) >= 0.95 * np.sum(fft))[0][0]]
-    
+    sum_fft = np.sum(fft)
+    mean_fft = np.mean(fft)
+
+    if sum_fft < 1e-6: # Effectively silent or problematic FFT
+        logger.warning(f"Onset at {onset_time:.3f}s has near-zero FFT sum. Returning zero spectral features.")
+        centroid = 0.0
+        bandwidth = 0.0
+        rolloff = 0.0
+        flatness = 1.0 # Flatness is 1 for pure noise/silence if mean_fft is also ~0, or 0 if mean_fft is used carefully
+        spread = 0.0
+    else:
+        # Spectral centroid
+        centroid = np.sum(freqs * fft) / sum_fft
+        
+        # Spectral bandwidth
+        # Ensure variance calculation is safe
+        variance = np.sum((freqs - centroid)**2 * fft) / sum_fft
+        bandwidth = np.sqrt(max(0, variance)) # max(0, ...) to avoid sqrt of small negative from precision issues
+        
+        # Spectral rolloff (95th percentile)
+        try:
+            rolloff_idx = np.where(np.cumsum(fft) >= 0.95 * sum_fft)[0][0]
+            rolloff = freqs[rolloff_idx]
+        except IndexError:
+            rolloff = freqs[-1] # Default to max frequency if something goes wrong
+            logger.warning(f"Could not determine rolloff for onset at {onset_time:.3f}s, defaulting to max freq.")
+
+        # Spectral flatness
+        # Add small epsilon to log argument as well for mean_fft in denominator
+        if mean_fft < 1e-10: # Avoid division by zero if mean_fft is tiny
+            flatness = 0.0 # Or 1.0, depending on interpretation for silence
+        else:
+            log_fft_mean = np.mean(np.log(fft + 1e-10))
+            flatness = np.exp(log_fft_mean) / (mean_fft + 1e-10) # add epsilon to mean_fft too
+        
+        # Spectral spread
+        spread_variance = np.sum((freqs - centroid)**2 * fft) / sum_fft # same as bandwidth variance
+        spread = np.sqrt(max(0, spread_variance))
+
     # Zero crossing rate
-    zcr = np.sum(np.abs(np.diff(np.signbit(window)))) / len(window)
+    if len(window) == 0: # Should be caught by earlier len(window) < 4 check, but as safeguard
+        zcr = 0.0
+    else:
+        zcr = np.sum(np.abs(np.diff(np.signbit(window)))) / len(window)
     
     # RMS energy
     rms = np.sqrt(np.mean(window**2))
     
-    # Spectral flatness
-    flatness = np.exp(np.mean(np.log(fft + 1e-10))) / np.mean(fft)
-    
-    # Spectral spread
-    spread = np.sqrt(np.sum((freqs - centroid)**2 * fft) / np.sum(fft))
-    
     # Scale RMS to a more usable range (0.1 to 1.0)
-    scaled_rms = 0.1 + 0.9 * (rms / np.max(audio_data))
+    max_audio_val = np.max(np.abs(audio_data))
+    if max_audio_val < 1e-6: # Avoid division by zero if audio is silent
+        scaled_rms = 0.0
+    else:
+        scaled_rms = 0.1 + 0.9 * (rms / max_audio_val)
     
     features = {
         "spectral_centroid": float(centroid),

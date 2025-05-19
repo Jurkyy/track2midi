@@ -33,7 +33,8 @@ def train_model(
     mp3_dir: str = DEFAULT_MP3_DIR,
     midi_dir: str = DEFAULT_MIDI_DIR,
     test_size: float = 0.2,
-    focus_on_classes: Optional[List[str]] = None
+    focus_on_classes: Optional[List[str]] = None,
+    use_synthetic_data: bool = True  # New parameter
 ) -> Dict:
     """Train the drum classifier model using both synthetic and real-world data.
     
@@ -46,6 +47,7 @@ def train_model(
         midi_dir: Directory containing MIDI files
         test_size: Proportion of samples to use for testing
         focus_on_classes: List of drum classes to focus on (e.g., ["snare", "snare_electric"])
+        use_synthetic_data: Whether to include synthetic data (default: True)
         
     Returns:
         Dictionary with training results
@@ -55,9 +57,14 @@ def train_model(
     # Initialize classifier
     classifier = DrumClassifierML()
     
-    # Generate synthetic training data
-    logger.info("Generating synthetic training data...")
-    synthetic_samples = generate_synthetic_training_data(num_samples=num_samples)
+    synthetic_samples = []
+    if use_synthetic_data:
+        # Generate synthetic training data
+        logger.info("Generating synthetic training data...")
+        synthetic_samples = generate_synthetic_training_data(num_samples=num_samples)
+    else:
+        logger.info("Skipping synthetic data generation as per request.")
+        num_samples = 0 # No synthetic samples means num_samples effectively becomes 0 for weighting logic
     
     # Collect real-world samples if requested
     real_samples = []
@@ -71,54 +78,59 @@ def train_model(
                 mp3_dir=mp3_dir, 
                 midi_dir=midi_dir,
                 target_classes=focus_on_classes,
-                max_files=5  # Limit to 5 files for faster training
             )
         else:
             # Standard collection from all available pairs
             real_samples = collect_samples_from_directory(
                 mp3_dir=mp3_dir,
                 midi_dir=midi_dir,
-                max_files=3  # Limit to 3 files for faster training
             )
     
     # Combine synthetic and real-world data with proper weighting
     all_samples = []
     
     if use_real_data and real_samples:
-        # Calculate sample weights to achieve desired balance
-        total_samples = num_samples + len(real_samples)
-        target_real_count = int(total_samples * real_data_weight)
-        target_synthetic_count = total_samples - target_real_count
-        
-        # Determine sampling rate for each source
-        if len(real_samples) > target_real_count:
-            # Need to subsample real data
-            real_sample_rate = target_real_count / len(real_samples)
-            synthetic_sample_rate = 1.0
-        else:
-            # Use all real data
-            real_sample_rate = 1.0
-            # May need to subsample synthetic data
-            remaining_space = target_synthetic_count
-            synthetic_sample_rate = min(1.0, remaining_space / len(synthetic_samples))
-        
-        # Apply sampling rates
-        logger.info(f"Balancing dataset - real data weight: {real_data_weight}")
-        logger.info(f"Real sample rate: {real_sample_rate}, synthetic sample rate: {synthetic_sample_rate}")
-        
-        # Add real samples
-        np.random.seed(42)  # For reproducibility
-        for sample in real_samples:
-            if np.random.random() < real_sample_rate:
-                all_samples.append(sample)
-        
-        # Add synthetic samples
-        for sample in synthetic_samples:
-            if np.random.random() < synthetic_sample_rate:
-                all_samples.append(sample)
-    else:
-        # Just use synthetic data
-        all_samples = synthetic_samples
+        if use_synthetic_data and synthetic_samples: # Both sources are present
+            # Calculate sample weights to achieve desired balance
+            # num_samples here refers to the original requested number of synthetic samples if they were generated
+            total_requested_synthetic = num_samples if use_synthetic_data else 0
+            total_samples_available = len(synthetic_samples) + len(real_samples)
+            
+            target_real_count = int(total_samples_available * real_data_weight)
+            target_synthetic_count = total_samples_available - target_real_count
+            
+            # Determine sampling rate for each source
+            if len(real_samples) > target_real_count:
+                real_sample_rate = target_real_count / len(real_samples)
+            else:
+                real_sample_rate = 1.0
+            
+            if len(synthetic_samples) > target_synthetic_count:
+                synthetic_sample_rate = target_synthetic_count / len(synthetic_samples)
+            else:
+                synthetic_sample_rate = 1.0
+
+            logger.info(f"Balancing dataset - real data weight: {real_data_weight}")
+            logger.info(f"Real sample rate: {real_sample_rate:.2f}, Synthetic sample rate: {synthetic_sample_rate:.2f}")
+            
+            np.random.seed(42) 
+            for sample in real_samples:
+                if np.random.random() < real_sample_rate:
+                    all_samples.append(sample)
+            for sample in synthetic_samples:
+                if np.random.random() < synthetic_sample_rate:
+                    all_samples.append(sample)
+        else: # Only real_samples are present (synthetic was skipped or empty)
+            all_samples.extend(real_samples)
+            logger.info(f"Using only real samples. Total: {len(real_samples)}")
+
+    elif use_synthetic_data and synthetic_samples: # Only synthetic_samples are present
+        all_samples.extend(synthetic_samples)
+        logger.info(f"Using only synthetic samples. Total: {len(synthetic_samples)}")
+    else: # No data from any source
+        logger.warning("No data available for training (neither real nor synthetic).")
+        # Return empty results or raise error
+        return {"accuracy": 0.0, "dataset_info": {"total_samples": 0, "real_samples": 0, "synthetic_samples": 0}}
     
     # Shuffle samples
     np.random.shuffle(all_samples)
@@ -162,7 +174,8 @@ def train_model(
         "total_samples": len(all_samples),
         "real_samples": real_count,
         "synthetic_samples": synthetic_count,
-        "real_data_weight": real_data_weight
+        "real_data_weight": real_data_weight,
+        "used_synthetic_data_flag": use_synthetic_data # Log the flag used
     }
     
     with open(metrics_path, 'w') as f:
@@ -220,7 +233,8 @@ def main() -> None:
         save_path=args.output,
         mp3_dir=args.mp3_dir,
         midi_dir=args.midi_dir,
-        test_size=args.test_size
+        test_size=args.test_size,
+        use_synthetic_data=True # Default for CLI, can add CLI arg later if needed
     )
 
 

@@ -10,6 +10,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.neural_network import MLPClassifier
 
 from .config import MODELS_DIR
 
@@ -27,10 +28,15 @@ class DrumSample:
 class DrumClassifierML:
     """Machine learning based drum hit classifier."""
     
-    def __init__(self) -> None:
-        """Initialize the classifier."""
+    def __init__(self, model_type: str = "mlp") -> None:
+        """Initialize the classifier.
+        
+        Args:
+            model_type: Type of model to use ("random_forest" or "mlp").
+        """
         self.model = None
         self.scaler = StandardScaler()
+        self.model_type = model_type
         self.feature_names = [
             "spectral_centroid", 
             "spectral_bandwidth",
@@ -62,13 +68,49 @@ class DrumClassifierML:
         Returns:
             Dictionary with training results and metrics
         """
-        logger.info(f"Training drum classifier on {len(samples)} samples")
+        logger.info(f"Training drum classifier ({self.model_type}) on {len(samples)} samples")
         
         # Extract features and labels
-        X = np.array([[sample.features[name] for name in self.feature_names] 
-                     for sample in samples])
+        X = np.array([[sample.features.get(name, 0.0) for name in self.feature_names] 
+                     for sample in samples], dtype=np.float64)
         y = np.array([sample.label for sample in samples])
         
+        logger.info(f"Created feature array X with shape: {X.shape} and dtype: {X.dtype}")
+        
+        # Force conversion and re-check for NaNs/Infs, just in case of subtle type issues
+        try:
+            X = X.astype(np.float64)
+        except ValueError as e:
+            logger.error(f"Could not convert X to float64: {e}. Dumping first 5 rows of X:")
+            for i in range(min(5, X.shape[0])):
+                logger.error(f"X[{i}]: {X[i]}")
+            # Potentially dump problematic samples that led to this X
+            # This indicates non-numeric data that .get(name, 0.0) didn't catch or that 0.0 itself is problematic in context
+            raise e # Re-raise the error as this is critical
+
+        logger.info(f"X dtype after astype(np.float64): {X.dtype}")
+
+        # Debugging: Check for NaNs or Infs in X before splitting
+        if np.any(np.isnan(X)):
+            logger.error("NaNs found in feature array X BEFORE splitting! Attempting to replace with 0.")
+            nan_rows = np.where(np.isnan(X).any(axis=1))[0]
+            logger.error(f"Rows with NaNs: {nan_rows[:20]}") # Log up to 20 problematic rows
+            for row_idx in nan_rows[:5]: # Log details for first 5
+                logger.error(f"Sample features (row {row_idx}): {samples[row_idx].features}")
+                logger.error(f"Converted X row (row {row_idx}): {X[row_idx]}")
+            X = np.nan_to_num(X, nan=0.0) # Replace NaNs
+            logger.warning("Replaced NaNs with 0.0 in X array.")
+
+        if np.any(np.isinf(X)):
+            logger.error("Infs found in feature array X BEFORE splitting! Attempting to replace with 0.")
+            inf_rows = np.where(np.isinf(X).any(axis=1))[0]
+            logger.error(f"Rows with Infs: {inf_rows[:20]}") # Log up to 20 problematic rows
+            for row_idx in inf_rows[:5]: # Log details for first 5
+                logger.error(f"Sample features (row {row_idx}): {samples[row_idx].features}")
+                logger.error(f"Converted X row (row {row_idx}): {X[row_idx]}")
+            X = np.nan_to_num(X, posinf=0.0, neginf=0.0) # Replace Infs
+            logger.warning("Replaced Infs with 0.0 in X array.")
+
         # Split data into training and testing sets
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=42, stratify=y
@@ -76,33 +118,69 @@ class DrumClassifierML:
         
         # Scale features
         self.scaler = StandardScaler()
+        
+        # Check for zero variance before fitting scaler
+        if np.any(np.std(X_train, axis=0) == 0):
+            logger.error("Zero variance found in one or more features of X_train BEFORE scaling!")
+            zero_var_cols = np.where(np.std(X_train, axis=0) == 0)[0]
+            logger.error(f"Columns with zero variance indices: {zero_var_cols}")
+            logger.error(f"Feature names with zero variance: {[self.feature_names[i] for i in zero_var_cols]}")
+            # This is problematic for StandardScaler. Consider removing these features or handling them.
+
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
+
+        # Debugging: Check for NaNs or Infs after scaling
+        if np.any(np.isnan(X_train_scaled)):
+            logger.error("NaNs found in X_train_scaled AFTER scaling!")
+        if np.any(np.isnan(X_test_scaled)):
+            logger.error("NaNs found in X_test_scaled AFTER scaling!")
         
-        # Train Random Forest model (good balance of accuracy and interpretability)
-        self.model = RandomForestClassifier(
-            n_estimators=200,          # More trees for better accuracy (was 100)
-            max_depth=15,              # Deeper trees for more complex patterns (was 10)
-            min_samples_split=4,       # Slightly more aggressive splitting (was 5)
-            min_samples_leaf=1,        # Allow smaller leaf nodes for more detail (was 2)
-            max_features='sqrt',       # Standard practice for random forests
-            bootstrap=True,            # Use bootstrapping
-            random_state=42,
-            class_weight='balanced',
-            n_jobs=-1                  # Use all available CPU cores
-        )
-        self.model.fit(X_train_scaled, y_train)
-        
+        feature_importance = {}
+
+        if self.model_type == "random_forest":
+            self.model = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=15,
+                min_samples_split=4,
+                min_samples_leaf=1,
+                max_features='sqrt',
+                bootstrap=True,
+                random_state=42,
+                class_weight='balanced',
+                n_jobs=-1
+            )
+            self.model.fit(X_train_scaled, y_train)
+            if hasattr(self.model, 'feature_importances_'):
+                feature_importance = dict(zip(self.feature_names, 
+                                            self.model.feature_importances_))
+        elif self.model_type == "mlp":
+            self.model = MLPClassifier(
+                hidden_layer_sizes=(100, 50),
+                activation='relu',
+                solver='adam',
+                alpha=0.0001,
+                batch_size='auto',
+                learning_rate='constant',
+                learning_rate_init=0.001,
+                max_iter=300,
+                shuffle=True,
+                random_state=42,
+                early_stopping=True,
+                n_iter_no_change=10,
+                verbose=False
+            )
+            self.model.fit(X_train_scaled, y_train)
+            logger.info("MLP model trained. Feature importance is not directly available for MLP like Random Forest.")
+        else:
+            raise ValueError(f"Unsupported model_type: {self.model_type}")
+
         # Evaluate model
         y_pred = self.model.predict(X_test_scaled)
         
         # Calculate metrics
         class_report = classification_report(y_test, y_pred, output_dict=True)
         conf_matrix = confusion_matrix(y_test, y_pred)
-        
-        # Extract feature importance
-        feature_importance = dict(zip(self.feature_names, 
-                                    self.model.feature_importances_))
         
         # Log results
         logger.info(f"Model trained with accuracy: {class_report['accuracy']:.4f}")
@@ -155,7 +233,8 @@ class DrumClassifierML:
             pickle.dump({
                 'model': self.model,
                 'scaler': self.scaler,
-                'feature_names': self.feature_names
+                'feature_names': self.feature_names,
+                'model_type': self.model_type
             }, f)
         
         logger.info(f"Model saved to {model_path}")
@@ -175,8 +254,9 @@ class DrumClassifierML:
                 self.model = data['model']
                 self.scaler = data['scaler']
                 self.feature_names = data['feature_names']
+                self.model_type = data.get('model_type', 'random_forest')
             
-            logger.info(f"Model loaded from {model_path}")
+            logger.info(f"Model ({self.model_type}) loaded from {model_path}")
             return True
             
         except (FileNotFoundError, KeyError) as e:
@@ -199,16 +279,26 @@ def load_or_create_classifier() -> DrumClassifierML:
     Returns:
         Drum classifier instance
     """
+    # Initialize with the desired default type (MLP)
+    classifier = DrumClassifierML(model_type="mlp") 
     model_path = get_default_model_path()
-    classifier = DrumClassifierML()
     
-    # Try to load existing model
     if os.path.exists(model_path):
+        logger.info(f"Attempting to load existing model from: {model_path}")
+        # Attempt to load; the load method sets the classifier.model_type from the file.
         if classifier.load(model_path):
-            return classifier
-    
-    # Return untrained classifier if model couldn't be loaded
-    logger.warning("No trained model found. Using untrained classifier.")
+            logger.info(f"Successfully loaded model of type: {classifier.model_type} from {model_path}")
+            # If the loaded model is not the desired default type (e.g., an old Random Forest),
+            # and we want to enforce the new default, we could re-initialize `classifier` here.
+            # For now, we use what's loaded. If the user wants to switch to MLP, they should retrain.
+            # If classifier.load() fails, it returns False, and we proceed with the fresh MLP instance.
+        else:
+            logger.warning(f"Failed to load model from {model_path}. A new {classifier.model_type} classifier will be used.")
+            # `classifier` is already the desired new MLP instance initialized above.
+    else:
+        logger.info(f"No existing model found at {model_path}. Creating a new {classifier.model_type} classifier.")
+        # `classifier` is already the desired new MLP instance initialized above.
+        
     return classifier
 
 
