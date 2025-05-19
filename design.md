@@ -16,12 +16,12 @@ This document outlines the software design for a prototype of the Audio to MIDI 
 
 The following Python libraries are proposed for the prototype:
 
-* **Audio Handling & Analysis:**
-    * **Soundfile:** For audio loading, resampling, Short-Time Fourier Transform (STFT), onset detection, feature extraction (MFCCs, spectral centroid, RMS energy), and tempo/beat estimation.
-        * *Justification:* Industry standard for music information retrieval (MIR) in Python, comprehensive and well-documented.
-* **Numerical Operations:**
-    * **NumPy:** For efficient numerical computation, especially array manipulation for audio data and features.
-        * *Justification:* Fundamental for scientific computing in Python and a core dependency for soundfile.
+* **Audio Handling & Input/Output:**
+    * **Soundfile:** For loading and saving audio files. It provides access to the raw audio data as NumPy arrays and information like sample rate, number of channels, and encoding.
+        * *Justification:* A widely used library for reading/writing audio files, based on `libsndfile`. It's robust and supports many formats.
+* **Numerical Operations & Audio Analysis:**
+    * **NumPy:** For efficient numerical computation, especially array manipulation for audio data. It will be used for tasks like mono conversion, normalization, and implementing basic audio analysis algorithms (e.g., RMS energy, simple onset detection, basic spectral features from FFT).
+        * *Justification:* Fundamental for scientific computing in Python. Many audio analysis tasks can be built using NumPy operations on the raw data provided by `soundfile`.
 * **MIDI Generation:**
     * **Mido:** For creating and manipulating MIDI messages and files.
         * *Justification:* Lightweight, straightforward API for direct MIDI event creation, suitable for MVP. (PrettyMIDI is an alternative for more complex MIDI tasks later).
@@ -31,6 +31,7 @@ The following Python libraries are proposed for the prototype:
 * **Machine Learning (Optional for MVP, placeholder for future):**
     * **Scikit-learn:** If ML-based classification is pursued (e.g., SVM, Random Forest).
         * *Justification:* Comprehensive and easy-to-use library for classical ML algorithms. (For MVP, a rule-based or template-matching approach will be prioritized).
+    * **Librosa (Optional, for specific advanced features):** While the goal is to minimize dependencies, `librosa` could be considered for specific, complex features like MFCCs or advanced onset/beat tracking if implementing them with NumPy proves too time-consuming for the MVP or later stages.
 * **Configuration:**
     * **JSON module (built-in):** For managing drum templates or simple configurations.
         * *Justification:* Easy to use, human-readable format for simple key-value configurations.
@@ -45,14 +46,14 @@ The software will be broken down into the following Python modules:
 
 * **Purpose:** Handles audio file loading, decoding, and initial preparation.
 * **Key Functions/Classes:**
-    * `load_audio(file_path: str, target_sr: int = 22050) -> Tuple[np.ndarray, float]:`
-        * Uses `librosa.load()` to load audio.
-        * Resamples to `target_sr` (e.g., 22050 Hz is common for MIR tasks and faster processing).
-        * Converts audio to mono using `librosa.to_mono()`.
-        * Returns a tuple: `(audio_data_np_array, sample_rate_float)`.
+    * `load_audio(file_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndarray, float]:`
+        * Uses `soundfile.read(file_path)` to load audio, which returns `(audio_data_np_array, native_sample_rate_float)`.
+        * If `target_sr` is provided and different from `native_sample_rate_float`:
+            * Resampling would be needed. `soundfile` itself does not resample. For MVP, consider processing at native sample rate, or implement/use a simple resampling function (e.g., using `numpy.interp` or a dedicated library like `resampy` if high quality is essential later). This function might initially skip resampling or raise a warning if `target_sr` is set.
+        * Converts audio to mono: If `audio_data.ndim > 1` and `audio_data.shape[1] > 1` (e.g., stereo), it's converted to mono (e.g., `audio_data = audio_data.mean(axis=1)`).
+        * Returns a tuple: `(mono_audio_data_np_array, sample_rate_float)`.
     * `normalize_audio(audio_data: np.ndarray) -> np.ndarray:`
-        * Normalizes the audio waveform (e.g., to peak at 1.0 or based on RMS).
-        * Uses `librosa.util.normalize()` or manual normalization.
+        * Normalizes the audio waveform using NumPy (e.g., peak normalization: `audio_data / np.max(np.abs(audio_data))`, or RMS-based normalization).
 * **Data Structures:**
     * `np.ndarray`: For storing audio waveform data.
 
@@ -60,33 +61,33 @@ The software will be broken down into the following Python modules:
 
 * **Purpose:** Core logic for detecting rhythmic events and classifying drum sounds.
 * **Key Functions/Classes:**
-    * **Onset Detection:**
-        * `detect_onsets(audio_data: np.ndarray, sr: float, sensitivity_factor: float = 1.0) -> np.ndarray:`
-            * Calculates an onset strength envelope using `librosa.onset.onset_strength()`.
-            * Detects onsets using `librosa.onset.onset_detect()`. The `sensitivity_factor` can be used to adjust the threshold multiplier if `librosa.util.peak_pick` is used directly on the strength envelope.
+    * **Onset Detection (MVP: Basic Energy-based):**
+        * `detect_onsets(audio_data: np.ndarray, sr: float, sensitivity_factor: float = 1.0, frame_length: int = 2048, hop_length: int = 512) -> np.ndarray:`
+            * Calculates a simple novelty function, e.g., by looking at changes in short-term RMS energy across frames.
+            * Uses `NumPy` for frame-wise energy calculation and peak picking in the novelty curve. The `sensitivity_factor` would adjust the peak picking threshold.
             * Returns `np.ndarray` of onset times in seconds.
-    * **Tempo and Beat Estimation:**
-        * `estimate_tempo(audio_data: np.ndarray, sr: float) -> float:`
-            * Uses `librosa.beat.tempo()` to estimate global tempo.
-            * Returns tempo in BPM (float).
-    * **Feature Extraction:**
+            * (Note: More sophisticated methods like those in `librosa` might be considered for future enhancements.)
+    * **Tempo and Beat Estimation (MVP: Simplified/Placeholder):**
+        * `estimate_tempo(audio_data: np.ndarray, sr: float) -> Optional[float]:`
+            * For MVP, this might be a very basic estimation (e.g., based on average onset intervals if available and somewhat regular) or return a default/user-provided value.
+            * Reliable tempo estimation from arbitrary audio is complex and might rely on more advanced algorithms (e.g., from `librosa` or custom autocorrelation-based methods with `NumPy`) in future iterations.
+            * Returns tempo in BPM (float) or `None`.
+    * **Feature Extraction (MVP: Basic Features with NumPy):**
         * `extract_features_for_onset(audio_data: np.ndarray, sr: float, onset_time: float, window_duration_ms: int = 100) -> Dict[str, any]:`
-            * Extracts an audio segment (window) around `onset_time`.
-            * Calculates features for this segment using Librosa:
-                * `librosa.feature.mfcc()`
-                * `librosa.feature.spectral_centroid()`
-                * `librosa.feature.spectral_bandwidth()`
-                * `librosa.feature.spectral_rolloff()`
-                * `librosa.feature.rms()` (for velocity estimation)
-            * Returns a dictionary: `{'mfccs': np.ndarray, 'spectral_centroid': float, 'rms': float, ...}`.
+            * Extracts an audio segment (window) around `onset_time` using `NumPy`.
+            * Calculates basic features for this segment using `NumPy`:
+                * RMS energy (for velocity estimation).
+                * Basic spectral features: e.g., spectral centroid, spectral spread, calculated from an FFT of the window (using `numpy.fft.rfft`).
+                * (Note: MFCCs and other advanced spectral features like those in `librosa` would require more complex implementations or using `librosa` for future enhancements).
+            * Returns a dictionary: `{'rms': float, 'spectral_centroid': float, ...}`.
     * **Drum Sound Classification (MVP: Rule-based/Template Matching):**
         * `DrumTemplates`: Class or dictionary to hold characteristic feature values for different drum types.
             * Example template structure (loaded from `drum_templates.json`):
                 ```json
                 {
-                    "kick": {"spectral_centroid_mean": 150, "spectral_centroid_std": 50, ...},
-                    "snare": {"spectral_centroid_mean": 1500, ...},
-                    "hihat_closed": {"spectral_centroid_mean": 3000, ...}
+                    "kick": {"spectral_centroid_mean": 150, "spectral_centroid_std": 50, "rms_min": 0.2},
+                    "snare": {"spectral_centroid_mean": 1500, "rms_min": 0.1},
+                    "hihat_closed": {"spectral_centroid_mean": 3000, "rms_min": 0.05}
                 }
                 ```
         * `load_drum_templates(template_file_path: str = "drum_templates.json") -> Dict:`
@@ -106,10 +107,11 @@ The software will be broken down into the following Python modules:
 * **Key Functions/Classes:**
     * `GM_DRUM_MAP: Dict[str, int] = {"kick": 36, "snare": 38, "hihat_closed": 42, ...}` (Constant)
     * `DetectedDrumEvent = TypedDict('DetectedDrumEvent', {'time_seconds': float, 'label': str, 'amplitude': float})` (Using `typing.TypedDict` for clarity)
-    * `create_midi_file(drum_events: List[DetectedDrumEvent], tempo_bpm: float, output_path: str, ppqn: int = 480) -> None:`
+    * `create_midi_file(drum_events: List[DetectedDrumEvent], tempo_bpm: Optional[float], output_path: str, ppqn: int = 480, default_tempo: float = 120.0) -> None:`
         * Initializes `mido.MidiFile(ticks_per_beat=ppqn)`.
         * Creates a `mido.MidiTrack`.
-        * Adds a tempo meta message: `mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(tempo_bpm))`.
+        * Uses `tempo_bpm` if provided and valid, otherwise uses `default_tempo`.
+        * Adds a tempo meta message: `mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(current_tempo_bpm))`.
         * For each `event` in `drum_events`:
             * Map `event['label']` to a MIDI note number using `GM_DRUM_MAP`.
             * Convert `event['amplitude']` (e.g., RMS energy from feature extraction, normalized 0-1) to MIDI velocity (0-127). Clamp values.
@@ -170,10 +172,10 @@ The software will be broken down into the following Python modules:
 4.  User clicks "Convert to MIDI": `_start_conversion()` is called.
     * A new thread is spawned, executing `_conversion_thread_target()`.
     * Inside the thread:
-        a.  `audio_data, sr = audio_processor.load_audio(self.audio_file_path, target_sr=config.DEFAULT_SAMPLE_RATE)`
+        a.  `audio_data, sr = audio_processor.load_audio(self.audio_file_path, target_sr=config.DEFAULT_SAMPLE_RATE)` (Note: `target_sr` handling depends on `load_audio` implementation, might process at native SR)
         b.  `audio_data = audio_processor.normalize_audio(audio_data)`
         c.  `onset_times_seconds = analysis_engine.detect_onsets(audio_data, sr, sensitivity_factor=self.sensitivity_var.get())`
-        d.  `tempo_bpm = analysis_engine.estimate_tempo(audio_data, sr)`
+        d.  `tempo_bpm = analysis_engine.estimate_tempo(audio_data, sr)` (May be `None`)
         e.  `templates = analysis_engine.load_drum_templates()` (if using templates)
         f.  `detected_drum_events: List[DetectedDrumEvent] = []`
         g.  For each `t_onset` in `onset_times_seconds`:
@@ -200,7 +202,7 @@ The software will be broken down into the following Python modules:
   `-> (analysis_engine)` `onset_times_seconds: np.ndarray`
   `-> (analysis_engine)` `features_per_onset: List[Dict[str, any]]`
   `-> (analysis_engine)` `classified_hits: List[Dict{'time_seconds': float, 'label': str, 'amplitude': float}]`
-  `-> (analysis_engine)` `tempo_bpm: float`
+  `-> (analysis_engine)` `tempo_bpm: Optional[float]`
   `-> (midi_generator)` `mido_object: mido.MidiFile`
   `->` `.mid file (disk)`
 
@@ -209,8 +211,8 @@ The software will be broken down into the following Python modules:
 ## 6. Error Handling Strategy
 
 * Use `try-except` blocks extensively:
-    * `audio_processor.py`: For `FileNotFoundError`, audio decoding errors (e.g., `soundfile`).
-    * `analysis_engine.py`: For numerical errors during feature extraction.
+    * `audio_processor.py`: For `FileNotFoundError`, audio decoding errors (e.g., from `soundfile`).
+    * `analysis_engine.py`: For numerical errors during feature extraction with `NumPy`.
     * `midi_generator.py`: For file writing errors (`IOError`).
     * `main_gui.py`: To catch errors from backend modules and display user-friendly messages via `tkinter.messagebox`.
 * Log detailed errors to the console for debugging.
@@ -245,7 +247,7 @@ This section outlines potential improvements and new features that can be added 
 * **Machine Learning Integration:**
     * Transition from rule-based/template matching to more robust machine learning models using `scikit-learn`.
     * Train classifiers (e.g., SVM, Random Forest, Gradient Boosting) on a labeled dataset of drum sounds (e.g., extracted onsets from IDMT-SMT-DRUMS, ENST-Drums, or a custom dataset).
-    * Features for ML: MFCCs, spectral contrast, chroma features, zero-crossing rate, etc., extracted by `soundfile`.
+    * Features for ML: MFCCs, spectral contrast, chroma features, zero-crossing rate, etc., extracted from raw audio data (provided by `soundfile`) using libraries like `librosa` or custom `NumPy` implementations.
     * Consider Deep Learning (e.g., CNNs with `TensorFlow/Keras` or `PyTorch`) if spectrograms are used directly as input for classification. This would require a more substantial dataset and training infrastructure.
 * **Expanded Drum Kit Detection:**
     * Train models to identify a wider range of drum instruments: open hi-hat, various toms (high, mid, low), crash cymbals, ride cymbals.
@@ -257,7 +259,7 @@ This section outlines potential improvements and new features that can be added 
 * **Velocity Dynamics:**
     * Refine velocity mapping. Instead of direct RMS, explore perceptually weighted energy or machine learning models to predict MIDI velocity more accurately from audio features.
 * **Quantization Options:**
-    * Implement more sophisticated quantization in `midi_generator.py` using `librosa.beat.beat_track` for more precise beat locations.
+    * Implement more sophisticated quantization in `midi_generator.py`. This might involve beat tracking, for which libraries like `librosa` (`librosa.beat.beat_track`) could be used to get precise beat locations.
     * Offer user-selectable quantization grids (e.g., 8th, 16th, 32nd notes, triplets) and strength (how strictly notes snap to the grid).
 * **Humanization:**
     * Add options for subtle, random variations in timing and velocity to make the MIDI output sound less robotic.
@@ -266,12 +268,12 @@ This section outlines potential improvements and new features that can be added 
 
 ### 8.3. Enhanced Audio Processing
 * **Source Separation Preprocessing:**
-    * Integrate an optional drum stem isolation step using a pre-trained source separation model like Spleeter (via its Python library) or Demucs. This would be part of `audio_processor.py`.
+    * Integrate an optional drum stem isolation step using a pre-trained source separation model like Spleeter (via its Python library) or Demucs. This would be part of `audio_processor.py`. The processed stem would then be read by `soundfile`.
     * Processing only the drum stem can significantly improve the accuracy of onset detection and classification by reducing interference from other instruments.
 * **Advanced Onset Detection:**
-    * Explore more advanced onset detection functions in `librosa` or other libraries like `madmom`, potentially allowing for different detection algorithms or parameters.
+    * Explore more advanced onset detection functions (e.g., from `librosa` or other libraries like `madmom`), or refine custom `NumPy`-based algorithms.
 * **Tempo Mapping for Variable Tempos:**
-    * Move beyond a single global tempo. Use `librosa.beat.beat_track` to get beat timings throughout the song and generate a tempo map. This would allow the MIDI to follow tempo changes in the original audio. The `midi_generator.py` would need to insert multiple tempo change meta-messages.
+    * Move beyond a single global tempo. Use beat tracking algorithms (e.g., `librosa.beat.beat_track` or similar from other libraries/custom code) to get beat timings throughout the song and generate a tempo map. This would allow the MIDI to follow tempo changes in the original audio. The `midi_generator.py` would need to insert multiple tempo change meta-messages.
 
 ### 8.4. User Interface and Experience (UX) Improvements
 * **GUI Upgrade:**
@@ -294,6 +296,6 @@ This section outlines potential improvements and new features that can be added 
 
 ### 8.6. Broader Functionality
 * **Support for More Audio Formats:**
-    * Extend `audio_processor.py` to support formats like OGG, FLAC, etc., leveraging `librosa`'s capabilities (which often relies on `soundfile` and `audioread`).
+    * Extend `audio_processor.py` to support formats like OGG, FLAC, etc., leveraging `soundfile`'s capabilities (which relies on the underlying `libsndfile` library for broad format support).
 * **Batch Processing:**
     * Allow users to process multiple audio files in a queue.

@@ -92,6 +92,36 @@ def detect_onsets(
     return onset_times
 
 
+def estimate_tempo(onset_times: np.ndarray, default_tempo: float = 120.0) -> float:
+    """Estimate tempo based on median inter-onset intervals.
+    
+    Args:
+        onset_times: Array of onset times in seconds.
+        default_tempo: Default tempo to return if estimation is not possible.
+        
+    Returns:
+        Estimated tempo in BPM.
+    """
+    if len(onset_times) > 1:
+        intervals = np.diff(onset_times)
+        # Filter for reasonable intervals (0.3s to 1.5s, i.e., 40 BPM to 200 BPM)
+        reasonable_intervals = intervals[(intervals >= 0.3) & (intervals <= 1.5)]
+        
+        if len(reasonable_intervals) > 0:
+            median_interval = np.median(reasonable_intervals)
+            tempo = 60.0 / median_interval
+            # Clamp tempo to a reasonable range
+            tempo = min(200.0, max(60.0, tempo))
+            logger.info(f"Estimated tempo from onsets: {tempo:.1f} BPM")
+            return tempo
+        else:
+            logger.info(f"No reasonable intervals found for tempo estimation, using default: {default_tempo} BPM")
+            return default_tempo
+    else:
+        logger.info(f"Not enough onsets to estimate tempo, using default: {default_tempo} BPM")
+        return default_tempo
+
+
 def extract_features_for_onset(
     audio_data: np.ndarray,
     sr: float,
@@ -223,37 +253,51 @@ def classify_drum_hit(features: Dict[str, float]) -> str:
     # Extract features
     centroid = features["spectral_centroid"]
     bandwidth = features["spectral_bandwidth"]
-    rolloff = features["spectral_rolloff"]
-    zcr = features["zero_crossing_rate"]
-    flatness = features["spectral_flatness"]
-    spread = features["spectral_spread"]
+    # rolloff = features["spectral_rolloff"] # Not used in current DRUM_TEMPLATES
+    # zcr = features["zero_crossing_rate"] # Not used in current DRUM_TEMPLATES
+    # flatness = features["spectral_flatness"] # Not used in current DRUM_TEMPLATES
+    # spread = features["spectral_spread"] # Not used in current DRUM_TEMPLATES
+    rms = features["rms"] # RMS might be useful for thresholding or tie-breaking
+
+    best_match = "unknown"
+    min_distance = float('inf')
+
+    for drum_type, template in DRUM_TEMPLATES.items():
+        # Calculate a simple distance (e.g., weighted Euclidean or Mahalanobis-like)
+        # For MVP, let's use normalized distance from mean, scaled by std if available
+        dist = 0
+        
+        # Spectral Centroid
+        if "spectral_centroid_mean" in template and "spectral_centroid_std" in template:
+            dist += ((centroid - template["spectral_centroid_mean"]) / template["spectral_centroid_std"])**2
+        elif "spectral_centroid_mean" in template: # If only mean is present
+            dist += ((centroid - template["spectral_centroid_mean"]) / (template["spectral_centroid_mean"] * 0.1))**2 # Assume 10% std if not specified
+
+        # Spectral Bandwidth
+        if "spectral_bandwidth_mean" in template and "spectral_bandwidth_std" in template:
+            dist += ((bandwidth - template["spectral_bandwidth_mean"]) / template["spectral_bandwidth_std"])**2
+        elif "spectral_bandwidth_mean" in template:
+            dist += ((bandwidth - template["spectral_bandwidth_mean"]) / (template["spectral_bandwidth_mean"] * 0.1))**2
+
+        # Example for RMS (if we add it to templates, e.g. "rms_min_threshold")
+        # if "rms_min_threshold" in template and rms < template["rms_min_threshold"]:
+        #     dist += float('inf') # Penalize if below RMS threshold
+
+        if dist < min_distance:
+            min_distance = dist
+            best_match = drum_type
+            
+    # Basic threshold for matching quality, if min_distance is too high, it's "unknown"
+    # This threshold is arbitrary and needs tuning.
+    # A distance based on sum of squared normalized differences (like chi-squared per degree of freedom)
+    # of 2-3 per feature might be a starting point. For 2 features, maybe threshold of 5-10.
+    MAX_ACCEPTABLE_DISTANCE = 10.0 # Needs tuning
+    if min_distance > MAX_ACCEPTABLE_DISTANCE:
+        logger.debug(f"Rule-based: No close match. Min distance {min_distance:.2f} for {best_match}. Classified as unknown.")
+        return "unknown"
     
-    # Get a random value for probability-based classification
-    rand_val = random.random()
-    
-    # Handle rare drum types first
-    if rand_val < 0.004:
-        if centroid > 3000 and bandwidth > 2000:
-            return "crash"  # Crash cymbal (note 49) - very rare
-        elif centroid < 800 and bandwidth < 1500:
-            return "tom_low"  # Low tom (note 45) - very rare
-        elif centroid < 1500 and bandwidth < 1800:
-            return "tom_floor"  # Floor tom (note 43) - very rare
-    
-    # Distribute common drum types
-    weighted_val = rand_val
-    
-    if weighted_val < 0.27:  # 27% kicks to reach ~31 hits
-        return "kick"  # Bass drum (note 36)
-    
-    elif weighted_val < 0.47:  # 20% electric snare to reach ~24 hits
-        return "snare_electric"  # Electric snare (note 40)
-    
-    elif weighted_val < 0.73:  # 26% hi-hats to reach ~31 hits
-        return "hihat_closed"  # Closed hi-hat (note 42)
-    
-    else:  # 27% rides to reach ~31 hits
-        return "ride"  # Ride cymbal (note 51)
+    logger.debug(f"Rule-based classification: {best_match} (distance: {min_distance:.2f})")
+    return best_match
 
 
 def is_using_ml_classification() -> bool:
@@ -328,28 +372,9 @@ def process_audio(
     onset_times = detect_onsets(audio_data, sr, sensitivity_factor)
     logger.info(f"Detected {len(onset_times)} onsets")
     
-    # Estimate tempo (simple estimation based on average time between onsets)
-    if len(onset_times) > 1:
-        # Calculate inter-onset intervals
-        intervals = np.diff(onset_times)
-        
-        # Limit analysis to reasonable tempo range (40-200 BPM)
-        reasonable_intervals = intervals[(intervals >= 0.3) & (intervals <= 1.5)]
-        
-        if len(reasonable_intervals) > 0:
-            # Calculate average interval in reasonable range
-            avg_interval = np.median(reasonable_intervals)
-            tempo = 60.0 / avg_interval
-        else:
-            # If no reasonable intervals found, use default
-            tempo = 120.0
-            
-        # Limit tempo to reasonable range
-        tempo = min(200.0, max(60.0, tempo))
-    else:
-        tempo = 120.0  # Default tempo if we can't detect enough onsets
-    
-    logger.info(f"Estimated tempo: {tempo:.1f} BPM")
+    # Estimate tempo
+    tempo = estimate_tempo(onset_times) # Call the new function
+    # logger.info(f"Estimated tempo: {tempo:.1f} BPM") # Logging is now inside estimate_tempo
     
     # Process each onset
     drum_events = []
