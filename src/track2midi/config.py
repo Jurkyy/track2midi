@@ -9,13 +9,15 @@ DEFAULT_PPQN = 480  # Pulses Per Quarter Note (MIDI resolution)
 GM_DRUM_MAP = {
     "kick": 36,  # Bass Drum 1
     "snare": 38,  # Acoustic Snare
+    "snare_electric": 40,  # Electric Snare
     "hihat_closed": 42,  # Closed Hi-Hat
     "hihat_open": 46,  # Open Hi-Hat
-    "crash": 49,  # Crash Cymbal 1
-    "ride": 51,  # Ride Cymbal 1
+    "tom_floor": 43,  # Floor Tom (Low)
     "tom_low": 45,  # Low Tom
     "tom_mid": 47,  # Mid Tom
     "tom_high": 50,  # High Tom
+    "crash": 49,  # Crash Cymbal 1
+    "ride": 51,  # Ride Cymbal 1
 }
 
 # Feature extraction settings

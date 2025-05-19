@@ -70,8 +70,9 @@ def create_midi_file(
     # Sort events by time
     drum_events = sorted(drum_events, key=lambda x: x.time_seconds)
     
-    # Convert drum events to MIDI messages
-    previous_time = 0
+    # Convert drum events to MIDI messages using a simpler approach with relative timing
+    last_tick = 0  # Track the last tick position
+    
     for event in drum_events:
         # Get MIDI note number for the drum type
         note = GM_DRUM_MAP.get(event.label)
@@ -83,24 +84,25 @@ def create_midi_file(
         velocity = int(min(127, max(60, event.amplitude * 127)))
         
         # Calculate absolute time in ticks
-        abs_ticks = int(event.time_seconds * tempo_bpm * ppqn / 60)
+        current_tick = int(event.time_seconds * tempo_bpm * ppqn / 60)
         
-        # Calculate delta time from previous event
-        if abs_ticks == 0:
-            delta_ticks = 0
-        else:
-            delta_ticks = abs_ticks - previous_time
+        # Calculate delta time (always positive because events are sorted)
+        delta_ticks = max(0, current_tick - last_tick)
         
-        # Add note on message
+        # Add note on message with delta time
         drum_track.append(mido.Message('note_on', note=note, velocity=velocity, 
-                                       time=delta_ticks, channel=9))
+                                      time=delta_ticks, channel=9))
         
-        # Add note off message (short duration - 1/32 note)
-        note_duration = ppqn // 8  # Short duration for drums
+        # Update the last tick position
+        last_tick = current_tick
+        
+        # Add note off message (immediately after note on, with fixed duration)
+        note_duration = ppqn // 8  # 1/32 note duration
         drum_track.append(mido.Message('note_off', note=note, velocity=0, 
-                                       time=note_duration, channel=9))
+                                      time=note_duration, channel=9))
         
-        previous_time = abs_ticks + note_duration
+        # Update tick position for the note off message
+        last_tick += note_duration
     
     # Add end of track message
     drum_track.append(mido.MetaMessage('end_of_track', time=0))
