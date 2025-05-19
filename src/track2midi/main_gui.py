@@ -10,12 +10,22 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import os
 from typing import Optional, Dict, Any
+import logging
+import soundfile as sf
+import numpy as np
+import time
 
 from .audio_processor import load_audio, normalize_audio
 from .analysis_engine import process_audio
 from .midi_generator import create_midi_file
 from .midi_compare import compare_midi_files, print_comparison_results
 from .config import DEFAULT_SAMPLE_RATE, DEFAULT_SENSITIVITY
+from .train_model import train_model
+from .ml_classifier import get_default_model_path
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class DrumConverterApp(tk.Tk):
     """Main application window for the Audio to MIDI Drum Track Converter."""
@@ -25,13 +35,13 @@ class DrumConverterApp(tk.Tk):
         super().__init__()
 
         # Window setup
-        self.title("Audio to MIDI Drum Track Converter")
-        self.geometry("600x400")
+        self.title("Track2MIDI - Audio to MIDI Drum Converter")
+        self.geometry("600x500")
         self.resizable(True, True)
 
         # Instance variables
         self.audio_file_path: Optional[str] = None
-        self.last_generated_midi: Optional[str] = None
+        self.output_midi_path: Optional[str] = None
         self.sensitivity_var = tk.DoubleVar(value=DEFAULT_SENSITIVITY)
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
@@ -52,7 +62,7 @@ class DrumConverterApp(tk.Tk):
         self.main_frame.rowconfigure(3, weight=1)  # Make status frame expandable
         
         # File input section
-        file_frame = ttk.LabelFrame(self.main_frame, text="File Input", padding="5")
+        file_frame = ttk.LabelFrame(self.main_frame, text="Audio Input", padding="5")
         file_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
         file_frame.columnconfigure(1, weight=1)
 
@@ -66,22 +76,64 @@ class DrumConverterApp(tk.Tk):
         param_frame.columnconfigure(1, weight=1)
 
         ttk.Label(param_frame, text="Sensitivity:").grid(row=0, column=0, padx=5)
-        sensitivity_scale = ttk.Scale(param_frame, from_=0.1, to=2.0, 
+        sensitivity_scale = ttk.Scale(param_frame, from_=0.1, to=5.0, 
                                     variable=self.sensitivity_var, orient=tk.HORIZONTAL)
         sensitivity_scale.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        ttk.Label(param_frame, textvariable=self.sensitivity_var).grid(row=0, column=2, padx=5, pady=5)
 
         # Processing section
-        process_frame = ttk.LabelFrame(self.main_frame, text="Processing", padding="5")
+        process_frame = ttk.LabelFrame(self.main_frame, text="Conversion", padding="5")
         process_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         process_frame.columnconfigure(0, weight=1)
 
         self.convert_button = ttk.Button(process_frame, text="Convert to MIDI", 
-                                       command=self._start_conversion)
+                                       command=self._start_conversion, state=tk.DISABLED)
         self.convert_button.grid(row=0, column=0, pady=5)
 
         self.progress_bar = ttk.Progressbar(process_frame, mode='indeterminate')
         self.progress_bar.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
 
+        self.status_label = ttk.Label(process_frame, text="Ready")
+        self.status_label.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        # Output section
+        output_frame = ttk.LabelFrame(self.main_frame, text="Output", padding="5")
+        output_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=1)
+
+        self.output_label = ttk.Label(output_frame, text="No MIDI file generated")
+        self.output_label.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        self.save_button = ttk.Button(output_frame, text="Save MIDI As...", 
+                                    command=self._save_midi_file, state=tk.DISABLED)
+        self.save_button.grid(row=0, column=1, padx=5, sticky=(tk.N, tk.S))
+
+        # Add ML model training section
+        ml_frame = ttk.LabelFrame(self.main_frame, text="Machine Learning", padding="5")
+        ml_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5)
+        ml_frame.columnconfigure(0, weight=1)
+        ml_frame.rowconfigure(0, weight=1)
+
+        ttk.Label(ml_frame, text="Train drum classification model using synthetic data").grid(row=0, column=0, padx=5, pady=5)
+
+        ml_buttons_frame = ttk.Frame(ml_frame)
+        ml_buttons_frame.grid(row=1, column=0, padx=5, sticky=(tk.W, tk.E))
+
+        # Number of samples for training
+        samples_frame = ttk.Frame(ml_buttons_frame)
+        samples_frame.grid(row=0, column=0, padx=5, sticky=(tk.W, tk.E))
+
+        ttk.Label(samples_frame, text="Samples:").grid(row=0, column=0, padx=5)
+        self.num_samples_var = tk.StringVar(value="2000")
+        samples_entry = ttk.Entry(samples_frame, textvariable=self.num_samples_var, width=8)
+        samples_entry.grid(row=0, column=1, padx=5)
+
+        # Train button
+        self.train_button = ttk.Button(ml_buttons_frame, text="Train Model", command=self._train_model)
+        self.train_button.grid(row=0, column=2, padx=5)
+
+        # Model status
         # Status section
         status_frame = ttk.LabelFrame(self.main_frame, text="Status", padding="5")
         status_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
