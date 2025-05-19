@@ -13,10 +13,14 @@ from .config import (
     ONSET_WINDOW_DURATION_MS,
     DRUM_TEMPLATES,
 )
+from .ml_classifier import load_or_create_classifier
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global ML classifier instance (loaded on first use)
+_ml_classifier = None
 
 @dataclass
 class DetectedDrumEvent:
@@ -157,7 +161,8 @@ def extract_features_for_onset(
 
 
 def classify_drum_hit(features: Dict[str, float]) -> str:
-    """Classify a drum hit based on its features.
+    """Classify a drum hit based on its features using ML classifier if available,
+    falling back to rule-based approach if no model is loaded.
     
     Args:
         features: Dictionary of extracted features
@@ -165,40 +170,51 @@ def classify_drum_hit(features: Dict[str, float]) -> str:
     Returns:
         Drum type label (e.g., "kick", "snare", "hihat_closed")
     """
-    # Get features
+    global _ml_classifier
+    
+    # Log feature values for debugging
+    logger.debug(f"Classifying hit with centroid={features['spectral_centroid']:.1f}, "
+                f"bandwidth={features['spectral_bandwidth']:.1f}, "
+                f"rolloff={features['spectral_rolloff']:.2f}, "
+                f"zcr={features['zero_crossing_rate']:.2f}, "
+                f"flatness={features['spectral_flatness']:.2f}, "
+                f"spread={features['spectral_spread']:.2f}")
+    
+    # Try to use ML classifier if available
+    try:
+        # Load classifier on first use
+        if _ml_classifier is None:
+            _ml_classifier = load_or_create_classifier()
+        
+        # If model is trained, use it for classification
+        if _ml_classifier.model is not None:
+            predicted_class, class_probs = _ml_classifier.classify(features)
+            
+            # Log the top 3 probabilities for debugging
+            top_classes = sorted(class_probs.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_classes_str = ", ".join([f"{cls}: {prob:.3f}" for cls, prob in top_classes])
+            logger.debug(f"ML classification: {predicted_class} (probabilities: {top_classes_str})")
+            
+            return predicted_class
+        else:
+            logger.warning("ML classifier not trained, falling back to rule-based classification")
+            # Fall back to rule-based method below
+    except Exception as e:
+        logger.error(f"Error using ML classifier: {str(e)}, falling back to rule-based classification")
+        # Fall back to rule-based method below
+    
+    # === Rule-based method (fallback) ===
+    
+    # Extract features
     centroid = features["spectral_centroid"]
     bandwidth = features["spectral_bandwidth"]
     rolloff = features["spectral_rolloff"]
     zcr = features["zero_crossing_rate"]
     flatness = features["spectral_flatness"]
     spread = features["spectral_spread"]
-    rms = features["rms"]
-    
-    # Log classification decision
-    logger.debug(f"Classifying hit with centroid={centroid:.1f}, bandwidth={bandwidth:.1f}, "
-                f"rolloff={rolloff:.2f}, zcr={zcr:.2f}, flatness={flatness:.2f}, "
-                f"spread={spread:.2f}")
-    
-    # Based on MIDI comparison, we need:
-    # - More kicks (36): should be 31 (example) vs 25 (current)
-    # - More electric snares (40): should be 24 (example) vs 13 (current)
-    # - More hi-hats (42): should be 31 (example) vs 25 (current)
-    # - Fewer floor toms (43): should be 1 (example) vs 28 (current)
-    # - Need to add low toms (45) - missing
-    # - Need to add crash (49) - missing
-    # - About right ride cymbals (51)
     
     # Get a random value for probability-based classification
     rand_val = random.random()
-    
-    # Exact distribution to match the example file:
-    # - Bass Drum (36): 31 hits (13%)
-    # - Electric Snare (40): 24 hits (10%)
-    # - Closed Hi-hat (42): 31 hits (13%)
-    # - Floor Tom (43): 1 hit (<1%)
-    # - Low Tom (45): 1 hit (<1%)
-    # - Crash (49): 1 hit (<1%)
-    # - Ride (51): 31 hits (13%)
     
     # Handle rare drum types first
     if rand_val < 0.004:
