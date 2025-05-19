@@ -17,11 +17,11 @@ This document outlines the software design for a prototype of the Audio to MIDI 
 The following Python libraries are proposed for the prototype:
 
 * **Audio Handling & Analysis:**
-    * **Librosa:** For audio loading, resampling, Short-Time Fourier Transform (STFT), onset detection, feature extraction (MFCCs, spectral centroid, RMS energy), and tempo/beat estimation.
+    * **Soundfile:** For audio loading, resampling, Short-Time Fourier Transform (STFT), onset detection, feature extraction (MFCCs, spectral centroid, RMS energy), and tempo/beat estimation.
         * *Justification:* Industry standard for music information retrieval (MIR) in Python, comprehensive and well-documented.
 * **Numerical Operations:**
     * **NumPy:** For efficient numerical computation, especially array manipulation for audio data and features.
-        * *Justification:* Fundamental for scientific computing in Python and a core dependency for Librosa.
+        * *Justification:* Fundamental for scientific computing in Python and a core dependency for soundfile.
 * **MIDI Generation:**
     * **Mido:** For creating and manipulating MIDI messages and files.
         * *Justification:* Lightweight, straightforward API for direct MIDI event creation, suitable for MVP. (PrettyMIDI is an alternative for more complex MIDI tasks later).
@@ -209,7 +209,7 @@ The software will be broken down into the following Python modules:
 ## 6. Error Handling Strategy
 
 * Use `try-except` blocks extensively:
-    * `audio_processor.py`: For `FileNotFoundError`, audio decoding errors (e.g., `librosa.util.exceptions.LibrosaError`).
+    * `audio_processor.py`: For `FileNotFoundError`, audio decoding errors (e.g., `soundfile`).
     * `analysis_engine.py`: For numerical errors during feature extraction.
     * `midi_generator.py`: For file writing errors (`IOError`).
     * `main_gui.py`: To catch errors from backend modules and display user-friendly messages via `tkinter.messagebox`.
@@ -245,7 +245,7 @@ This section outlines potential improvements and new features that can be added 
 * **Machine Learning Integration:**
     * Transition from rule-based/template matching to more robust machine learning models using `scikit-learn`.
     * Train classifiers (e.g., SVM, Random Forest, Gradient Boosting) on a labeled dataset of drum sounds (e.g., extracted onsets from IDMT-SMT-DRUMS, ENST-Drums, or a custom dataset).
-    * Features for ML: MFCCs, spectral contrast, chroma features, zero-crossing rate, etc., extracted by `librosa`.
+    * Features for ML: MFCCs, spectral contrast, chroma features, zero-crossing rate, etc., extracted by `soundfile`.
     * Consider Deep Learning (e.g., CNNs with `TensorFlow/Keras` or `PyTorch`) if spectrograms are used directly as input for classification. This would require a more substantial dataset and training infrastructure.
 * **Expanded Drum Kit Detection:**
     * Train models to identify a wider range of drum instruments: open hi-hat, various toms (high, mid, low), crash cymbals, ride cymbals.

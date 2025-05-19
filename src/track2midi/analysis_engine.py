@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple, TypedDict
 from dataclasses import dataclass
 import logging
 import random
+import os
 
 from .config import (
     DEFAULT_SENSITIVITY,
@@ -13,7 +14,7 @@ from .config import (
     ONSET_WINDOW_DURATION_MS,
     DRUM_TEMPLATES,
 )
-from .ml_classifier import load_or_create_classifier
+from .ml_classifier import load_or_create_classifier, get_default_model_path
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Global ML classifier instance (loaded on first use)
 _ml_classifier = None
+_using_ml_classification = False
 
 @dataclass
 class DetectedDrumEvent:
@@ -170,7 +172,7 @@ def classify_drum_hit(features: Dict[str, float]) -> str:
     Returns:
         Drum type label (e.g., "kick", "snare", "hihat_closed")
     """
-    global _ml_classifier
+    global _ml_classifier, _using_ml_classification
     
     # Log feature values for debugging
     logger.debug(f"Classifying hit with centroid={features['spectral_centroid']:.1f}, "
@@ -180,28 +182,41 @@ def classify_drum_hit(features: Dict[str, float]) -> str:
                 f"flatness={features['spectral_flatness']:.2f}, "
                 f"spread={features['spectral_spread']:.2f}")
     
+    # Check if model file exists first
+    model_path = get_default_model_path()
+    model_exists = os.path.exists(model_path)
+    
     # Try to use ML classifier if available
-    try:
-        # Load classifier on first use
-        if _ml_classifier is None:
-            _ml_classifier = load_or_create_classifier()
-        
-        # If model is trained, use it for classification
-        if _ml_classifier.model is not None:
-            predicted_class, class_probs = _ml_classifier.classify(features)
+    if model_exists:
+        try:
+            # Load classifier on first use
+            if _ml_classifier is None:
+                _ml_classifier = load_or_create_classifier()
+                _using_ml_classification = True
+                logger.info("Using ML-based classification")
             
-            # Log the top 3 probabilities for debugging
-            top_classes = sorted(class_probs.items(), key=lambda x: x[1], reverse=True)[:3]
-            top_classes_str = ", ".join([f"{cls}: {prob:.3f}" for cls, prob in top_classes])
-            logger.debug(f"ML classification: {predicted_class} (probabilities: {top_classes_str})")
-            
-            return predicted_class
-        else:
-            logger.warning("ML classifier not trained, falling back to rule-based classification")
+            # If model is trained, use it for classification
+            if _ml_classifier.model is not None:
+                predicted_class, class_probs = _ml_classifier.classify(features)
+                
+                # Log the top 3 probabilities for debugging
+                top_classes = sorted(class_probs.items(), key=lambda x: x[1], reverse=True)[:3]
+                top_classes_str = ", ".join([f"{cls}: {prob:.3f}" for cls, prob in top_classes])
+                logger.debug(f"ML classification: {predicted_class} (probabilities: {top_classes_str})")
+                
+                return predicted_class
+            else:
+                logger.warning("ML classifier instance exists but model is None, falling back to rule-based classification")
+                _using_ml_classification = False
+                # Fall back to rule-based method below
+        except Exception as e:
+            logger.error(f"Error using ML classifier: {str(e)}, falling back to rule-based classification")
+            _using_ml_classification = False
             # Fall back to rule-based method below
-    except Exception as e:
-        logger.error(f"Error using ML classifier: {str(e)}, falling back to rule-based classification")
-        # Fall back to rule-based method below
+    else:
+        if not _using_ml_classification:  # Only log once
+            logger.info("No trained model found at path: {}. Using rule-based classification".format(model_path))
+            _using_ml_classification = False
     
     # === Rule-based method (fallback) ===
     
@@ -241,6 +256,48 @@ def classify_drum_hit(features: Dict[str, float]) -> str:
         return "ride"  # Ride cymbal (note 51)
 
 
+def is_using_ml_classification() -> bool:
+    """Check if ML classification is being used.
+    
+    Returns:
+        True if ML classification is active, False otherwise
+    """
+    global _using_ml_classification
+    return _using_ml_classification
+
+
+def force_load_ml_classifier() -> bool:
+    """Explicitly loads the ML classifier and activates ML classification.
+    
+    Returns:
+        True if ML classifier was successfully loaded, False otherwise
+    """
+    global _ml_classifier, _using_ml_classification
+    
+    # Check if model file exists
+    model_path = get_default_model_path()
+    if not os.path.exists(model_path):
+        logger.warning(f"No trained model found at path: {model_path}")
+        return False
+    
+    try:
+        # Load or reload the ML classifier
+        _ml_classifier = load_or_create_classifier()
+        
+        # Check if model was loaded successfully
+        if _ml_classifier.model is not None:
+            _using_ml_classification = True
+            logger.info("ML classifier loaded and activated successfully")
+            return True
+        else:
+            logger.warning("ML classifier instance created but model is None")
+            return False
+    
+    except Exception as e:
+        logger.error(f"Error loading ML classifier: {str(e)}")
+        return False
+
+
 def process_audio(
     audio_data: np.ndarray,
     sr: float,
@@ -257,6 +314,15 @@ def process_audio(
         Tuple of (list of detected drum events, estimated tempo)
     """
     logger.info("Starting audio processing...")
+    
+    # Check if ML classification will be used by loading model first
+    global _ml_classifier
+    model_path = get_default_model_path()
+    if os.path.exists(model_path) and _ml_classifier is None:
+        _ml_classifier = load_or_create_classifier()
+        
+    # Report which classification method will be used
+    logger.info(f"Will use {'ML-based' if is_using_ml_classification() else 'rule-based'} classification")
     
     # Detect onsets
     onset_times = detect_onsets(audio_data, sr, sensitivity_factor)

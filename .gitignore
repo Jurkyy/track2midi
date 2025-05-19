@@ -2,3 +2,9 @@
 # pixi environments
 .pixi
 *.egg-info
+
+# project specific
+examples/
+results/
+
+**/__pycache__/
