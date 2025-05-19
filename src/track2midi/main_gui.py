@@ -45,9 +45,7 @@ class DrumConverterApp(tk.Tk):
         self.sensitivity_var = tk.DoubleVar(value=DEFAULT_SENSITIVITY)
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
-        self.use_real_data_var = tk.BooleanVar(value=True)
         self.focus_on_snare_var = tk.BooleanVar(value=True)
-        self.use_synthetic_data_var = tk.BooleanVar(value=True)
 
         # Create main frame
         self.main_frame = ttk.Frame(self, padding="10")
@@ -126,34 +124,9 @@ class DrumConverterApp(tk.Tk):
         ml_buttons_frame.grid(row=1, column=0, padx=5, sticky=(tk.W, tk.E))
         ml_buttons_frame.columnconfigure(3, weight=1)  # Give extra space to the right
 
-        # Number of samples for training
-        samples_frame = ttk.Frame(ml_buttons_frame)
-        samples_frame.grid(row=0, column=0, padx=5, sticky=(tk.W, tk.E))
-
-        ttk.Label(samples_frame, text="Synthetic Samples:").grid(row=0, column=0, padx=5)
-        self.num_samples_var = tk.StringVar(value="2000")
-        samples_entry = ttk.Entry(samples_frame, textvariable=self.num_samples_var, width=8)
-        samples_entry.grid(row=0, column=1, padx=5)
-        
         # Create a frame for checkboxes
         checkbox_frame = ttk.Frame(ml_buttons_frame)
-        checkbox_frame.grid(row=0, column=1, padx=5)
-        
-        # Real data checkbox
-        use_real_data_cb = ttk.Checkbutton(
-            checkbox_frame, 
-            text="Use real data", 
-            variable=self.use_real_data_var
-        )
-        use_real_data_cb.grid(row=0, column=0, padx=5, sticky=tk.W)
-        
-        # Synthetic data checkbox
-        use_synthetic_data_cb = ttk.Checkbutton(
-            checkbox_frame, 
-            text="Use synthetic data", 
-            variable=self.use_synthetic_data_var
-        )
-        use_synthetic_data_cb.grid(row=1, column=0, padx=5, sticky=tk.W)
+        checkbox_frame.grid(row=0, column=0, padx=5, sticky=(tk.W, tk.E))
 
         # Focus on snare checkbox
         focus_on_snare_cb = ttk.Checkbutton(
@@ -161,7 +134,7 @@ class DrumConverterApp(tk.Tk):
             text="Focus on snare",
             variable=self.focus_on_snare_var
         )
-        focus_on_snare_cb.grid(row=0, column=1, padx=5, sticky=tk.W)
+        focus_on_snare_cb.grid(row=0, column=0, padx=5, sticky=tk.W)
 
         # Train button
         self.train_button = ttk.Button(ml_buttons_frame, text="Train Model", command=self._train_model)
@@ -356,88 +329,69 @@ class DrumConverterApp(tk.Tk):
             self.convert_button.config(state='normal')
 
     def _train_model(self) -> None:
-        """Train the ML model with synthetic data."""
-        try:
-            # Get number of samples
-            try:
-                num_samples = int(self.num_samples_var.get())
-                if num_samples < 100:
-                    raise ValueError("Number of samples must be at least 100")
-            except ValueError:
-                messagebox.showerror("Error", "Invalid number of samples")
-                return
-            
-            # Disable buttons and show progress
-            self.convert_button.config(state='disabled')
-            self.train_button.config(state='disabled')
-            self.progress_bar.start()
-            self._update_status(f"Training ML model with {num_samples} samples...")
-            
-            # Start training in a separate thread
-            thread = threading.Thread(target=self._training_thread_target, 
-                                    args=(num_samples,))
-            thread.daemon = True
-            thread.start()
-            
-        except Exception as e:
-            logger.error(f"Training setup error: {str(e)}")
-            messagebox.showerror("Error", f"Failed to start training: {str(e)}")
-            self.train_button.config(state='normal')
-            if self.audio_file_path:
-                self.convert_button.config(state='normal')
+        """Start the ML model training process in a separate thread."""
+        if self.processing_thread and self.processing_thread.is_alive():
+            messagebox.showwarning("Training Busy", "A training process is already running.")
+            return
 
-    def _training_thread_target(self, num_samples: int) -> None:
-        """Target function for the model training thread."""
+        self._update_status("Starting model training...")
+        self.train_button.config(state=tk.DISABLED)
+        self.load_ml_button.config(state=tk.DISABLED) # Disable load button during training
+
+        self.processing_thread = threading.Thread(
+            target=self._training_thread_target,
+            # args=() # No arguments needed now
+            daemon=True
+        )
+        self.processing_thread.start()
+        self.after(100, self._check_training_progress)
+
+    def _check_training_progress(self) -> None:
+        """Check the progress of the training process."""
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.progress_bar.start()
+            self.progress_bar.step(1)
+            self.after(100, self._check_training_progress)
+        else:
+            self.progress_bar.stop()
+            self.progress_bar.step(0)
+            self.after(100, self._check_ml_classification_status)
+
+    def _training_thread_target(self) -> None:
+        """Handles the actual model training in a background thread."""
         try:
-            # Get real data option 
-            use_real_data = self.use_real_data_var.get()
             focus_on_snare = self.focus_on_snare_var.get()
+
+            logger.info("Starting training process in background thread...")
             
-            # Prepare training message
-            training_msg = f"Training ML model with {num_samples} samples"
-            if use_real_data:
-                training_msg += " including real data"
-                if focus_on_snare:
-                    training_msg += " (focused on snare drums)"
-            else:
-                training_msg += " using synthetic data only"
+            start_time = time.time()
             
-            # Update status
-            self.after(0, lambda: self._update_status(training_msg + "..."))
-            
-            # Prepare focus classes
-            focus_classes = ["snare", "snare_electric"] if focus_on_snare and use_real_data else None
-            
-            # Train the model
-            results = train_model(
-                num_samples=num_samples,
-                use_real_data=use_real_data,
-                real_data_weight=0.6,  # Give real data 60% of the weight
-                focus_on_classes=focus_classes,
-                use_synthetic_data=self.use_synthetic_data_var.get()
+            focus_classes_value = ["snare"] if focus_on_snare else None
+
+            accuracy, report, model_path = train_model(
+                focus_on_classes=focus_classes_value,
             )
             
-            # Update UI with success
-            accuracy = results.get("accuracy", 0)
-            dataset_info = results.get("dataset_info", {})
+            end_time = time.time()
+            training_duration = end_time - start_time # Added for clarity in message
             
-            # Construct success_msg safely here, as it's used in a lambda
-            success_msg_details = f"Model trained with accuracy: {accuracy:.2%}"
-            real_samples = dataset_info.get("real_samples", 0)
-            synthetic_samples = dataset_info.get("synthetic_samples", 0)
-            total_samples = dataset_info.get("total_samples", 0)
-
-            if total_samples > 0:
-                success_msg_details += f"\nUsed {total_samples} samples total:"
-                if real_samples > 0:
-                    success_msg_details += f"\n- {real_samples} real samples ({real_samples/total_samples:.1%})"
-                if synthetic_samples > 0:
-                    success_msg_details += f"\n- {synthetic_samples} synthetic samples ({synthetic_samples/total_samples:.1%})"
+            if accuracy is not None and report is not None:
+                status_message = (
+                    f"Training complete in {training_duration:.2f}s. Model saved to {model_path}\\n"
+                    f"Accuracy: {accuracy:.4f}\\nClassification Report:\\n{report}"
+                )
+                logger.info(status_message)
+                # Show success messagebox in main thread
+                success_popup_message = f"Model trained successfully in {training_duration:.2f}s.\\nAccuracy: {accuracy:.4f}"
+                self.after(0, lambda msg=success_popup_message: messagebox.showinfo("Training Success", msg))
+                self.after(0, lambda: self._update_model_status(True)) # Update status in main thread
+            else:
+                status_message = f"Training failed after {training_duration:.2f}s. Check logs for details."
+                logger.error(status_message)
+                self.after(0, lambda: messagebox.showerror("Training Failed", status_message))
+                self.after(0, lambda: self._update_model_status(False)) # Update status in main thread
             
-            self.after(0, self._update_model_status, True)
-            self.after(0, self._check_ml_classification_status)
-            self.after(0, lambda msg=success_msg_details: messagebox.showinfo("Success", msg))
-            self.after(0, lambda: self._update_status("Model training complete!"))
+            self._update_status(status_message)
             
         except Exception as training_exception:
             logger.error(f"Training error: {str(training_exception)}")
@@ -448,7 +402,7 @@ class DrumConverterApp(tk.Tk):
         finally:
             # Re-enable buttons and stop progress bar
             self.after(0, lambda: self.train_button.config(state='normal'))
-            self.after(0, lambda: self.convert_button.config(state='normal' if self.audio_file_path else 'disabled'))
+            self.after(0, lambda: self.load_ml_button.config(state='normal'))
             self.after(0, lambda: self.progress_bar.stop())
 
     def _load_ml_model(self) -> None:

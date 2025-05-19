@@ -1,4 +1,4 @@
-"""Train the ML drum classifier with synthetic and real-world data."""
+"""Train the ML drum classifier with real-world data."""
 
 import os
 import logging
@@ -11,7 +11,6 @@ import json
 from .ml_classifier import (
     DrumClassifierML, 
     DrumSample, 
-    generate_synthetic_training_data,
     get_default_model_path
 )
 from .real_data_collector import collect_samples_from_directory, collect_focused_samples
@@ -26,52 +25,33 @@ DEFAULT_MP3_DIR = os.path.join(DEFAULT_EXAMPLES_DIR, "mp3")
 DEFAULT_MIDI_DIR = os.path.join(DEFAULT_EXAMPLES_DIR, "midi")
 
 def train_model(
-    num_samples: int = 2000,
     use_real_data: bool = True,
-    real_data_weight: float = 0.6,  # Weight given to real-world data (0-1)
     save_path: Optional[str] = None,
     mp3_dir: str = DEFAULT_MP3_DIR,
     midi_dir: str = DEFAULT_MIDI_DIR,
     test_size: float = 0.2,
-    focus_on_classes: Optional[List[str]] = None,
-    use_synthetic_data: bool = True  # New parameter
-) -> Dict:
-    """Train the drum classifier model using both synthetic and real-world data.
+    focus_on_classes: Optional[List[str]] = None
+) -> tuple[float, str, str]:
+    """Train the drum classifier model using real-world data.
     
     Args:
-        num_samples: Number of synthetic samples to generate
-        use_real_data: Whether to include real-world data
-        real_data_weight: Weight given to real data vs synthetic (0-1)
+        use_real_data: Whether to include real-world data (will be true by default effectively)
         save_path: Path to save the model, or None for default
         mp3_dir: Directory containing MP3 files
         midi_dir: Directory containing MIDI files
         test_size: Proportion of samples to use for testing
-        focus_on_classes: List of drum classes to focus on (e.g., ["snare", "snare_electric"])
-        use_synthetic_data: Whether to include synthetic data (default: True)
+        focus_on_classes: List of drum classes to focus on
         
     Returns:
-        Dictionary with training results
+        Tuple of (accuracy, classification_report_string, model_save_path)
     """
-    logger.info(f"Starting model training with {num_samples} synthetic samples")
+    logger.info("Starting model training using exclusively real-world data.")
     
-    # Initialize classifier
     classifier = DrumClassifierML()
     
-    synthetic_samples = []
-    if use_synthetic_data:
-        # Generate synthetic training data
-        logger.info("Generating synthetic training data...")
-        synthetic_samples = generate_synthetic_training_data(num_samples=num_samples)
-    else:
-        logger.info("Skipping synthetic data generation as per request.")
-        num_samples = 0 # No synthetic samples means num_samples effectively becomes 0 for weighting logic
-    
-    # Collect real-world samples if requested
     real_samples = []
     if use_real_data:
         logger.info("Collecting real-world training data...")
-        
-        # Use focused sampling if specific classes are requested
         if focus_on_classes:
             logger.info(f"Using focused sampling for classes: {focus_on_classes}")
             real_samples = collect_focused_samples(
@@ -80,65 +60,25 @@ def train_model(
                 target_classes=focus_on_classes,
             )
         else:
-            # Standard collection from all available pairs
             real_samples = collect_samples_from_directory(
                 mp3_dir=mp3_dir,
                 midi_dir=midi_dir,
             )
     
-    # Combine synthetic and real-world data with proper weighting
-    all_samples = []
-    
-    if use_real_data and real_samples:
-        if use_synthetic_data and synthetic_samples: # Both sources are present
-            # Calculate sample weights to achieve desired balance
-            # num_samples here refers to the original requested number of synthetic samples if they were generated
-            total_requested_synthetic = num_samples if use_synthetic_data else 0
-            total_samples_available = len(synthetic_samples) + len(real_samples)
-            
-            target_real_count = int(total_samples_available * real_data_weight)
-            target_synthetic_count = total_samples_available - target_real_count
-            
-            # Determine sampling rate for each source
-            if len(real_samples) > target_real_count:
-                real_sample_rate = target_real_count / len(real_samples)
-            else:
-                real_sample_rate = 1.0
-            
-            if len(synthetic_samples) > target_synthetic_count:
-                synthetic_sample_rate = target_synthetic_count / len(synthetic_samples)
-            else:
-                synthetic_sample_rate = 1.0
+    if not real_samples:
+        logger.error("No real samples collected. Cannot train model.")
+        # Return a structure consistent with successful training but indicating no data
+        return 0.0, "No samples collected. Training cannot proceed.", get_default_model_path()
 
-            logger.info(f"Balancing dataset - real data weight: {real_data_weight}")
-            logger.info(f"Real sample rate: {real_sample_rate:.2f}, Synthetic sample rate: {synthetic_sample_rate:.2f}")
-            
-            np.random.seed(42) 
-            for sample in real_samples:
-                if np.random.random() < real_sample_rate:
-                    all_samples.append(sample)
-            for sample in synthetic_samples:
-                if np.random.random() < synthetic_sample_rate:
-                    all_samples.append(sample)
-        else: # Only real_samples are present (synthetic was skipped or empty)
-            all_samples.extend(real_samples)
-            logger.info(f"Using only real samples. Total: {len(real_samples)}")
-
-    elif use_synthetic_data and synthetic_samples: # Only synthetic_samples are present
-        all_samples.extend(synthetic_samples)
-        logger.info(f"Using only synthetic samples. Total: {len(synthetic_samples)}")
-    else: # No data from any source
-        logger.warning("No data available for training (neither real nor synthetic).")
-        # Return empty results or raise error
-        return {"accuracy": 0.0, "dataset_info": {"total_samples": 0, "real_samples": 0, "synthetic_samples": 0}}
+    all_samples = real_samples
+    logger.info(f"Using {len(all_samples)} real samples for training.")
     
     # Shuffle samples
     np.random.shuffle(all_samples)
     
-    # Log dataset composition
-    real_count = sum(1 for s in all_samples if s in real_samples)
-    synthetic_count = len(all_samples) - real_count
-    logger.info(f"Final dataset composition: {real_count} real samples, {synthetic_count} synthetic samples")
+    # Log dataset composition (real data only now)
+    real_count = len(all_samples)
+    logger.info(f"Final dataset composition: {real_count} real samples")
     
     # Train the model
     logger.info(f"Training classifier on {len(all_samples)} samples...")
@@ -158,7 +98,6 @@ def train_model(
     # Save training metrics
     metrics_path = os.path.splitext(save_path)[0] + "_metrics.json"
     
-    # Convert numpy arrays to lists for JSON serialization
     sanitized_results = {}
     for key, value in results.items():
         if isinstance(value, dict):
@@ -169,13 +108,11 @@ def train_model(
         else:
             sanitized_results[key] = value
     
-    # Add dataset info
     sanitized_results["dataset_info"] = {
         "total_samples": len(all_samples),
         "real_samples": real_count,
-        "synthetic_samples": synthetic_count,
-        "real_data_weight": real_data_weight,
-        "used_synthetic_data_flag": use_synthetic_data # Log the flag used
+        # "synthetic_samples": 0, # Removed
+        # "used_synthetic_data_flag": False # Removed
     }
     
     with open(metrics_path, 'w') as f:
@@ -184,27 +121,48 @@ def train_model(
     logger.info(f"Training metrics saved to {metrics_path}")
     logger.info(f"Model trained with accuracy: {results['accuracy']:.4f}")
     
-    return results
+    # Extract report for return value, ensure it's a string
+    report_for_return = results.get("classification_report", {})
+    if isinstance(report_for_return, dict):
+        report_str_for_return = classification_report_to_str(report_for_return)
+    else:
+        report_str_for_return = str(report_for_return)
 
+    return results['accuracy'], report_str_for_return, save_path # Updated return value
+
+def classification_report_to_str(report_dict: Dict) -> str:
+    """Converts a classification report dictionary to a formatted string."""
+    lines = []
+    # Check if it's the full report dict or just the accuracy score etc.
+    if not isinstance(report_dict, dict) or not any(isinstance(v, dict) for v in report_dict.values()):
+        return str(report_dict) # Not a full report, just str it
+
+    for label, metrics in report_dict.items():
+        if label in ["accuracy", "macro avg", "weighted avg"]:
+            if isinstance(metrics, dict): # e.g. weighted avg can be a dict
+                line = f"{label}: " + " ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k,v in metrics.items() if k!= 'support'])
+                lines.append(line)
+                if 'support' in metrics:
+                    lines.append(f"    support: {metrics['support']}")
+            elif isinstance(metrics, float): # accuracy is a float
+                 lines.append(f"{label}: {metrics:.4f}")
+            else:
+                lines.append(f"{label}: {metrics}") # Other top-level items like macro avg fields
+        elif isinstance(metrics, dict): # Per-class metrics
+            lines.append(f"{label}:")
+            metric_items = [f"{metric_name}: {value:.4f}" if isinstance(value, float) else f"{metric_name}: {value}" 
+                            for metric_name, value in metrics.items()]
+            lines.append("  " + " | ".join(metric_items))
+        else: # Fallback for unexpected structure
+            lines.append(f"{label}: {metrics}")
+    return "\n".join(lines)
 
 def main() -> None:
     """Command-line entry point for training the model."""
-    parser = argparse.ArgumentParser(description="Train the drum classification model")
-    parser.add_argument(
-        "--samples", type=int, default=2000,
-        help="Number of synthetic samples to generate (default: 2000)"
-    )
+    parser = argparse.ArgumentParser(description="Train the drum classification model (uses real data only)")
     parser.add_argument(
         "--real-data", action="store_true", default=True,
-        help="Use real-world data from examples directory (default: True)"
-    )
-    parser.add_argument(
-        "--no-real-data", action="store_false", dest="real_data",
-        help="Don't use real-world data, only synthetic"
-    )
-    parser.add_argument(
-        "--real-weight", type=float, default=0.6,
-        help="Weight to give to real-world data vs synthetic (0-1, default: 0.6)"
+        help="Use real-world data from examples directory (default: True, always active now)"
     )
     parser.add_argument(
         "--mp3-dir", type=str, default=DEFAULT_MP3_DIR,
@@ -225,18 +183,13 @@ def main() -> None:
     
     args = parser.parse_args()
     
-    # Train the model
     train_model(
-        num_samples=args.samples,
-        use_real_data=args.real_data,
-        real_data_weight=args.real_weight,
+        use_real_data=True,
         save_path=args.output,
         mp3_dir=args.mp3_dir,
         midi_dir=args.midi_dir,
-        test_size=args.test_size,
-        use_synthetic_data=True # Default for CLI, can add CLI arg later if needed
+        test_size=args.test_size
     )
-
 
 if __name__ == "__main__":
     main() 

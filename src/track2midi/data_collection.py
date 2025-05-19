@@ -146,30 +146,30 @@ def collect_samples_from_list(
     return samples
 
 
-def mix_synthetic_and_real_data(
-    real_samples: List[DrumSample],
-    num_synthetic: int = 1000,
-) -> List[DrumSample]:
-    """Mix real samples with synthetic data for improved training.
-    
-    Args:
-        real_samples: List of real drum samples
-        num_synthetic: Number of synthetic samples to generate
-        
-    Returns:
-        Combined list of samples
-    """
-    from .ml_classifier import generate_synthetic_training_data
-    
-    # Generate synthetic data
-    synthetic_samples = generate_synthetic_training_data(num_synthetic)
-    
-    # Combine and shuffle
-    combined_samples = real_samples + synthetic_samples
-    np.random.shuffle(combined_samples)
-    
-    logger.info(f"Combined dataset: {len(real_samples)} real samples + "
-               f"{len(synthetic_samples)} synthetic samples = "
-               f"{len(combined_samples)} total samples")
-    
-    return combined_samples 
+# def mix_synthetic_and_real_data(
+#     real_samples: List[DrumSample],
+#     num_synthetic: int = 1000,
+# ) -> List[DrumSample]:
+#     """Mix real samples with synthetic data for improved training.
+#     
+#     Args:
+#         real_samples: List of real drum samples
+#         num_synthetic: Number of synthetic samples to generate
+#         
+#     Returns:
+#         Combined list of samples
+#     """
+#     from .ml_classifier import generate_synthetic_training_data
+#     
+#     # Generate synthetic data
+#     synthetic_samples = generate_synthetic_training_data(num_synthetic)
+#     
+#     # Combine and shuffle
+#     combined_samples = real_samples + synthetic_samples
+#     np.random.shuffle(combined_samples)
+#     
+#     logger.info(f"Combined dataset: {len(real_samples)} real samples + "
+#                f"{len(synthetic_samples)} synthetic samples = "
+#                f"{len(combined_samples)} total samples")
+#     
+#     return combined_samples 
