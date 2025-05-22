@@ -1,5 +1,15 @@
 """Configuration settings for the Track2MIDI application."""
 
+import os
+
+# Paths
+# Get the directory where the module is installed
+MODULE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODELS_DIR = os.path.join(MODULE_DIR, "models")
+
+# Ensure the models directory exists
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 # Audio processing settings
 DEFAULT_SAMPLE_RATE = 22050
 DEFAULT_SENSITIVITY = 1.0

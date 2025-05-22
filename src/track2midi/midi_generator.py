@@ -3,10 +3,13 @@
 import mido
 import os
 from datetime import datetime
-from typing import List
+from typing import List, Optional
+import logging
 
 from .config import DEFAULT_PPQN, GM_DRUM_MAP
 from .analysis_engine import DetectedDrumEvent
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_results_dir() -> str:
@@ -22,17 +25,20 @@ def ensure_results_dir() -> str:
 
 def create_midi_file(
     drum_events: List[DetectedDrumEvent],
-    tempo_bpm: float,
+    tempo_bpm: Optional[float],
     output_path: str,
     ppqn: int = DEFAULT_PPQN,
+    default_tempo: float = 120.0
 ) -> str:
     """Create a MIDI file from detected drum events.
     
     Args:
         drum_events: List of detected drum events
-        tempo_bpm: Tempo in beats per minute
-        output_path: Path to save the MIDI file
+        tempo_bpm: Tempo in beats per minute. If None or outside a reasonable range,
+                   `default_tempo` will be used.
+        output_path: Original intended path to save the MIDI file (filename will be modified)
         ppqn: Pulses Per Quarter Note (MIDI resolution)
+        default_tempo: Default tempo to use if `tempo_bpm` is not provided or is unrealistic.
         
     Returns:
         Path to the saved MIDI file
@@ -44,9 +50,12 @@ def create_midi_file(
     if not drum_events:
         raise ValueError("No drum events to convert to MIDI")
     
-    # If the estimated tempo is unrealistic, use a default tempo
-    if tempo_bpm < 60 or tempo_bpm > 200:
-        tempo_bpm = 120.0
+    current_tempo_bpm = tempo_bpm
+    if current_tempo_bpm is None or current_tempo_bpm < 40 or current_tempo_bpm > 240: # Wider reasonable range
+        logger.info(f"Provided tempo {tempo_bpm} BPM is None or unrealistic. Using default tempo: {default_tempo} BPM.")
+        current_tempo_bpm = default_tempo
+    else:
+        logger.info(f"Using provided tempo: {current_tempo_bpm:.1f} BPM.")
     
     # Create a new MIDI file
     mid = mido.MidiFile(ticks_per_beat=ppqn, type=1)  # Type 1 for multiple tracks
@@ -56,8 +65,8 @@ def create_midi_file(
     mid.tracks.append(tempo_track)
     
     # Add tempo meta message
-    tempo = mido.bpm2tempo(tempo_bpm)
-    tempo_track.append(mido.MetaMessage('set_tempo', tempo=tempo))
+    tempo_val = mido.bpm2tempo(current_tempo_bpm)
+    tempo_track.append(mido.MetaMessage('set_tempo', tempo=tempo_val))
     
     # Create a drum track
     drum_track = mido.MidiTrack()
@@ -77,14 +86,15 @@ def create_midi_file(
         # Get MIDI note number for the drum type
         note = GM_DRUM_MAP.get(event.label)
         if note is None:
-            print(f"Warning: Unknown drum type '{event.label}', skipping event")
+            # Use a logger for warnings
+            logger.warning(f"Unknown drum type '{event.label}' for event at {event.time_seconds:.2f}s, skipping event")
             continue  # Skip unknown drum types
         
         # Convert amplitude to MIDI velocity (60-127 for better dynamics)
         velocity = int(min(127, max(60, event.amplitude * 127)))
         
         # Calculate absolute time in ticks
-        current_tick = int(event.time_seconds * tempo_bpm * ppqn / 60)
+        current_tick = int(event.time_seconds * current_tempo_bpm * ppqn / 60)
         
         # Calculate delta time (always positive because events are sorted)
         delta_ticks = max(0, current_tick - last_tick)

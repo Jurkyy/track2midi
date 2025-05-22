@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple, TypedDict
 from dataclasses import dataclass
 import logging
 import random
+import os
 
 from .config import (
     DEFAULT_SENSITIVITY,
@@ -13,10 +14,15 @@ from .config import (
     ONSET_WINDOW_DURATION_MS,
     DRUM_TEMPLATES,
 )
+from .ml_classifier import load_or_create_classifier, get_default_model_path
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global ML classifier instance (loaded on first use)
+_ml_classifier = None
+_using_ml_classification = False
 
 @dataclass
 class DetectedDrumEvent:
@@ -86,6 +92,36 @@ def detect_onsets(
     return onset_times
 
 
+def estimate_tempo(onset_times: np.ndarray, default_tempo: float = 120.0) -> float:
+    """Estimate tempo based on median inter-onset intervals.
+    
+    Args:
+        onset_times: Array of onset times in seconds.
+        default_tempo: Default tempo to return if estimation is not possible.
+        
+    Returns:
+        Estimated tempo in BPM.
+    """
+    if len(onset_times) > 1:
+        intervals = np.diff(onset_times)
+        # Filter for reasonable intervals (0.3s to 1.5s, i.e., 40 BPM to 200 BPM)
+        reasonable_intervals = intervals[(intervals >= 0.3) & (intervals <= 1.5)]
+        
+        if len(reasonable_intervals) > 0:
+            median_interval = np.median(reasonable_intervals)
+            tempo = 60.0 / median_interval
+            # Clamp tempo to a reasonable range
+            tempo = min(200.0, max(60.0, tempo))
+            logger.info(f"Estimated tempo from onsets: {tempo:.1f} BPM")
+            return tempo
+        else:
+            logger.info(f"No reasonable intervals found for tempo estimation, using default: {default_tempo} BPM")
+            return default_tempo
+    else:
+        logger.info(f"Not enough onsets to estimate tempo, using default: {default_tempo} BPM")
+        return default_tempo
+
+
 def extract_features_for_onset(
     audio_data: np.ndarray,
     sr: float,
@@ -112,34 +148,78 @@ def extract_features_for_onset(
     end_sample = min(len(audio_data), onset_sample + window_samples // 2)
     window = audio_data[start_sample:end_sample]
     
+    # Add a check for empty or very short window to prevent errors
+    if len(window) < 4: # Minimum length for FFT and meaningful features (e.g. a few samples for rfft)
+        logger.warning(f"Onset at {onset_time:.3f}s has a very short window (len: {len(window)}). Returning zero features.")
+        return {
+            "spectral_centroid": 0.0,
+            "spectral_bandwidth": 0.0,
+            "spectral_rolloff": 0.0,
+            "zero_crossing_rate": 0.0,
+            "spectral_flatness": 0.0,
+            "spectral_spread": 0.0,
+            "rms": 0.0,
+        }
+
     # Calculate FFT
     fft = np.abs(np.fft.rfft(window))
     freqs = np.fft.rfftfreq(len(window), 1/sr)
     
     # Calculate features
-    # Spectral centroid
-    centroid = np.sum(freqs * fft) / np.sum(fft)
-    
-    # Spectral bandwidth
-    bandwidth = np.sqrt(np.sum((freqs - centroid)**2 * fft) / np.sum(fft))
-    
-    # Spectral rolloff (95th percentile)
-    rolloff = freqs[np.where(np.cumsum(fft) >= 0.95 * np.sum(fft))[0][0]]
-    
+    sum_fft = np.sum(fft)
+    mean_fft = np.mean(fft)
+
+    if sum_fft < 1e-6: # Effectively silent or problematic FFT
+        logger.warning(f"Onset at {onset_time:.3f}s has near-zero FFT sum. Returning zero spectral features.")
+        centroid = 0.0
+        bandwidth = 0.0
+        rolloff = 0.0
+        flatness = 1.0 # Flatness is 1 for pure noise/silence if mean_fft is also ~0, or 0 if mean_fft is used carefully
+        spread = 0.0
+    else:
+        # Spectral centroid
+        centroid = np.sum(freqs * fft) / sum_fft
+        
+        # Spectral bandwidth
+        # Ensure variance calculation is safe
+        variance = np.sum((freqs - centroid)**2 * fft) / sum_fft
+        bandwidth = np.sqrt(max(0, variance)) # max(0, ...) to avoid sqrt of small negative from precision issues
+        
+        # Spectral rolloff (95th percentile)
+        try:
+            rolloff_idx = np.where(np.cumsum(fft) >= 0.95 * sum_fft)[0][0]
+            rolloff = freqs[rolloff_idx]
+        except IndexError:
+            rolloff = freqs[-1] # Default to max frequency if something goes wrong
+            logger.warning(f"Could not determine rolloff for onset at {onset_time:.3f}s, defaulting to max freq.")
+
+        # Spectral flatness
+        # Add small epsilon to log argument as well for mean_fft in denominator
+        if mean_fft < 1e-10: # Avoid division by zero if mean_fft is tiny
+            flatness = 0.0 # Or 1.0, depending on interpretation for silence
+        else:
+            log_fft_mean = np.mean(np.log(fft + 1e-10))
+            flatness = np.exp(log_fft_mean) / (mean_fft + 1e-10) # add epsilon to mean_fft too
+        
+        # Spectral spread
+        spread_variance = np.sum((freqs - centroid)**2 * fft) / sum_fft # same as bandwidth variance
+        spread = np.sqrt(max(0, spread_variance))
+
     # Zero crossing rate
-    zcr = np.sum(np.abs(np.diff(np.signbit(window)))) / len(window)
+    if len(window) == 0: # Should be caught by earlier len(window) < 4 check, but as safeguard
+        zcr = 0.0
+    else:
+        zcr = np.sum(np.abs(np.diff(np.signbit(window)))) / len(window)
     
     # RMS energy
     rms = np.sqrt(np.mean(window**2))
     
-    # Spectral flatness
-    flatness = np.exp(np.mean(np.log(fft + 1e-10))) / np.mean(fft)
-    
-    # Spectral spread
-    spread = np.sqrt(np.sum((freqs - centroid)**2 * fft) / np.sum(fft))
-    
     # Scale RMS to a more usable range (0.1 to 1.0)
-    scaled_rms = 0.1 + 0.9 * (rms / np.max(audio_data))
+    max_audio_val = np.max(np.abs(audio_data))
+    if max_audio_val < 1e-6: # Avoid division by zero if audio is silent
+        scaled_rms = 0.0
+    else:
+        scaled_rms = 0.1 + 0.9 * (rms / max_audio_val)
     
     features = {
         "spectral_centroid": float(centroid),
@@ -157,7 +237,8 @@ def extract_features_for_onset(
 
 
 def classify_drum_hit(features: Dict[str, float]) -> str:
-    """Classify a drum hit based on its features.
+    """Classify a drum hit based on its features using ML classifier if available,
+    falling back to rule-based approach if no model is loaded.
     
     Args:
         features: Dictionary of extracted features
@@ -165,64 +246,144 @@ def classify_drum_hit(features: Dict[str, float]) -> str:
     Returns:
         Drum type label (e.g., "kick", "snare", "hihat_closed")
     """
-    # Get features
+    global _ml_classifier, _using_ml_classification
+    
+    # Log feature values for debugging
+    logger.debug(f"Classifying hit with centroid={features['spectral_centroid']:.1f}, "
+                f"bandwidth={features['spectral_bandwidth']:.1f}, "
+                f"rolloff={features['spectral_rolloff']:.2f}, "
+                f"zcr={features['zero_crossing_rate']:.2f}, "
+                f"flatness={features['spectral_flatness']:.2f}, "
+                f"spread={features['spectral_spread']:.2f}")
+    
+    # Check if model file exists first
+    model_path = get_default_model_path()
+    model_exists = os.path.exists(model_path)
+    
+    # Try to use ML classifier if available
+    if model_exists:
+        try:
+            # Load classifier on first use
+            if _ml_classifier is None:
+                _ml_classifier = load_or_create_classifier()
+                _using_ml_classification = True
+                logger.info("Using ML-based classification")
+            
+            # If model is trained, use it for classification
+            if _ml_classifier.model is not None:
+                predicted_class, class_probs = _ml_classifier.classify(features)
+                
+                # Log the top 3 probabilities for debugging
+                top_classes = sorted(class_probs.items(), key=lambda x: x[1], reverse=True)[:3]
+                top_classes_str = ", ".join([f"{cls}: {prob:.3f}" for cls, prob in top_classes])
+                logger.debug(f"ML classification: {predicted_class} (probabilities: {top_classes_str})")
+                
+                return predicted_class
+            else:
+                logger.warning("ML classifier instance exists but model is None, falling back to rule-based classification")
+                _using_ml_classification = False
+                # Fall back to rule-based method below
+        except Exception as e:
+            logger.error(f"Error using ML classifier: {str(e)}, falling back to rule-based classification")
+            _using_ml_classification = False
+            # Fall back to rule-based method below
+    else:
+        if not _using_ml_classification:  # Only log once
+            logger.info("No trained model found at path: {}. Using rule-based classification".format(model_path))
+            _using_ml_classification = False
+    
+    # === Rule-based method (fallback) ===
+    
+    # Extract features
     centroid = features["spectral_centroid"]
     bandwidth = features["spectral_bandwidth"]
-    rolloff = features["spectral_rolloff"]
-    zcr = features["zero_crossing_rate"]
-    flatness = features["spectral_flatness"]
-    spread = features["spectral_spread"]
-    rms = features["rms"]
+    # rolloff = features["spectral_rolloff"] # Not used in current DRUM_TEMPLATES
+    # zcr = features["zero_crossing_rate"] # Not used in current DRUM_TEMPLATES
+    # flatness = features["spectral_flatness"] # Not used in current DRUM_TEMPLATES
+    # spread = features["spectral_spread"] # Not used in current DRUM_TEMPLATES
+    rms = features["rms"] # RMS might be useful for thresholding or tie-breaking
+
+    best_match = "unknown"
+    min_distance = float('inf')
+
+    for drum_type, template in DRUM_TEMPLATES.items():
+        # Calculate a simple distance (e.g., weighted Euclidean or Mahalanobis-like)
+        # For MVP, let's use normalized distance from mean, scaled by std if available
+        dist = 0
+        
+        # Spectral Centroid
+        if "spectral_centroid_mean" in template and "spectral_centroid_std" in template:
+            dist += ((centroid - template["spectral_centroid_mean"]) / template["spectral_centroid_std"])**2
+        elif "spectral_centroid_mean" in template: # If only mean is present
+            dist += ((centroid - template["spectral_centroid_mean"]) / (template["spectral_centroid_mean"] * 0.1))**2 # Assume 10% std if not specified
+
+        # Spectral Bandwidth
+        if "spectral_bandwidth_mean" in template and "spectral_bandwidth_std" in template:
+            dist += ((bandwidth - template["spectral_bandwidth_mean"]) / template["spectral_bandwidth_std"])**2
+        elif "spectral_bandwidth_mean" in template:
+            dist += ((bandwidth - template["spectral_bandwidth_mean"]) / (template["spectral_bandwidth_mean"] * 0.1))**2
+
+        # Example for RMS (if we add it to templates, e.g. "rms_min_threshold")
+        # if "rms_min_threshold" in template and rms < template["rms_min_threshold"]:
+        #     dist += float('inf') # Penalize if below RMS threshold
+
+        if dist < min_distance:
+            min_distance = dist
+            best_match = drum_type
+            
+    # Basic threshold for matching quality, if min_distance is too high, it's "unknown"
+    # This threshold is arbitrary and needs tuning.
+    # A distance based on sum of squared normalized differences (like chi-squared per degree of freedom)
+    # of 2-3 per feature might be a starting point. For 2 features, maybe threshold of 5-10.
+    MAX_ACCEPTABLE_DISTANCE = 10.0 # Needs tuning
+    if min_distance > MAX_ACCEPTABLE_DISTANCE:
+        logger.debug(f"Rule-based: No close match. Min distance {min_distance:.2f} for {best_match}. Classified as unknown.")
+        return "unknown"
     
-    # Log classification decision
-    logger.debug(f"Classifying hit with centroid={centroid:.1f}, bandwidth={bandwidth:.1f}, "
-                f"rolloff={rolloff:.2f}, zcr={zcr:.2f}, flatness={flatness:.2f}, "
-                f"spread={spread:.2f}")
+    logger.debug(f"Rule-based classification: {best_match} (distance: {min_distance:.2f})")
+    return best_match
+
+
+def is_using_ml_classification() -> bool:
+    """Check if ML classification is being used.
     
-    # Based on MIDI comparison, we need:
-    # - More kicks (36): should be 31 (example) vs 25 (current)
-    # - More electric snares (40): should be 24 (example) vs 13 (current)
-    # - More hi-hats (42): should be 31 (example) vs 25 (current)
-    # - Fewer floor toms (43): should be 1 (example) vs 28 (current)
-    # - Need to add low toms (45) - missing
-    # - Need to add crash (49) - missing
-    # - About right ride cymbals (51)
+    Returns:
+        True if ML classification is active, False otherwise
+    """
+    global _using_ml_classification
+    return _using_ml_classification
+
+
+def force_load_ml_classifier() -> bool:
+    """Explicitly loads the ML classifier and activates ML classification.
     
-    # Get a random value for probability-based classification
-    rand_val = random.random()
+    Returns:
+        True if ML classifier was successfully loaded, False otherwise
+    """
+    global _ml_classifier, _using_ml_classification
     
-    # Exact distribution to match the example file:
-    # - Bass Drum (36): 31 hits (13%)
-    # - Electric Snare (40): 24 hits (10%)
-    # - Closed Hi-hat (42): 31 hits (13%)
-    # - Floor Tom (43): 1 hit (<1%)
-    # - Low Tom (45): 1 hit (<1%)
-    # - Crash (49): 1 hit (<1%)
-    # - Ride (51): 31 hits (13%)
+    # Check if model file exists
+    model_path = get_default_model_path()
+    if not os.path.exists(model_path):
+        logger.warning(f"No trained model found at path: {model_path}")
+        return False
     
-    # Handle rare drum types first
-    if rand_val < 0.004:
-        if centroid > 3000 and bandwidth > 2000:
-            return "crash"  # Crash cymbal (note 49) - very rare
-        elif centroid < 800 and bandwidth < 1500:
-            return "tom_low"  # Low tom (note 45) - very rare
-        elif centroid < 1500 and bandwidth < 1800:
-            return "tom_floor"  # Floor tom (note 43) - very rare
+    try:
+        # Load or reload the ML classifier
+        _ml_classifier = load_or_create_classifier()
+        
+        # Check if model was loaded successfully
+        if _ml_classifier.model is not None:
+            _using_ml_classification = True
+            logger.info("ML classifier loaded and activated successfully")
+            return True
+        else:
+            logger.warning("ML classifier instance created but model is None")
+            return False
     
-    # Distribute common drum types
-    weighted_val = rand_val
-    
-    if weighted_val < 0.27:  # 27% kicks to reach ~31 hits
-        return "kick"  # Bass drum (note 36)
-    
-    elif weighted_val < 0.47:  # 20% electric snare to reach ~24 hits
-        return "snare_electric"  # Electric snare (note 40)
-    
-    elif weighted_val < 0.73:  # 26% hi-hats to reach ~31 hits
-        return "hihat_closed"  # Closed hi-hat (note 42)
-    
-    else:  # 27% rides to reach ~31 hits
-        return "ride"  # Ride cymbal (note 51)
+    except Exception as e:
+        logger.error(f"Error loading ML classifier: {str(e)}")
+        return False
 
 
 def process_audio(
@@ -242,32 +403,22 @@ def process_audio(
     """
     logger.info("Starting audio processing...")
     
+    # Check if ML classification will be used by loading model first
+    global _ml_classifier
+    model_path = get_default_model_path()
+    if os.path.exists(model_path) and _ml_classifier is None:
+        _ml_classifier = load_or_create_classifier()
+        
+    # Report which classification method will be used
+    logger.info(f"Will use {'ML-based' if is_using_ml_classification() else 'rule-based'} classification")
+    
     # Detect onsets
     onset_times = detect_onsets(audio_data, sr, sensitivity_factor)
     logger.info(f"Detected {len(onset_times)} onsets")
     
-    # Estimate tempo (simple estimation based on average time between onsets)
-    if len(onset_times) > 1:
-        # Calculate inter-onset intervals
-        intervals = np.diff(onset_times)
-        
-        # Limit analysis to reasonable tempo range (40-200 BPM)
-        reasonable_intervals = intervals[(intervals >= 0.3) & (intervals <= 1.5)]
-        
-        if len(reasonable_intervals) > 0:
-            # Calculate average interval in reasonable range
-            avg_interval = np.median(reasonable_intervals)
-            tempo = 60.0 / avg_interval
-        else:
-            # If no reasonable intervals found, use default
-            tempo = 120.0
-            
-        # Limit tempo to reasonable range
-        tempo = min(200.0, max(60.0, tempo))
-    else:
-        tempo = 120.0  # Default tempo if we can't detect enough onsets
-    
-    logger.info(f"Estimated tempo: {tempo:.1f} BPM")
+    # Estimate tempo
+    tempo = estimate_tempo(onset_times) # Call the new function
+    # logger.info(f"Estimated tempo: {tempo:.1f} BPM") # Logging is now inside estimate_tempo
     
     # Process each onset
     drum_events = []
